@@ -235,6 +235,52 @@ EOF
   detail "sender-authentication gate; without it every tool call returns -10000."
 }
 
+# ── re-sign for hook injection ─────────────────────────────────────────
+
+# Re-sign the (patched) binary so a non-Codex caller can inject team_hook.dylib.
+# Runs on EVERY install — including a re-run on an already-patched binary — so
+# the signing strategy also reaches machines patched by an older installer.
+#
+# Entitlements applied to the inner (launched) binary:
+#   - disable-library-validation: load the ad-hoc dylib despite the team-id
+#     mismatch (else the process is SIGKILL'd "Code Signature Invalid" the
+#     moment the hook is injected — seen on macOS 15.3.1).
+#   - allow-dyld-environment-variables: honor DYLD_INSERT_LIBRARIES under
+#     hardened runtime.
+# We DROP the binary's original entitlements instead of --preserve-metadata:
+# ad-hoc + restricted `com.apple.private.*` entitlements is rejected by AMFI on
+# newer macOS (error -424/-427, seen on macOS 27). Trade-off: on very new macOS
+# this can reduce the deeper Service capability (get_app_state may hit -10005);
+# list_apps and the hook itself still work.
+resign_binary() {
+  info ""
+  info "Re-signing for hook injection…"
+  local ent; ent="$(mktemp -t cua_ent).plist"
+  cat > "$ent" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+</dict>
+</plist>
+PLIST
+  # Outer --deep first (clean ad-hoc baseline), then the inner binary LAST so
+  # it keeps the entitlements above.
+  codesign -s - --force --deep "${CUA_APP}" 2>/dev/null && ok "Outer app signed"
+  codesign -s - --force --entitlements "$ent" "${INNER_APP}" 2>/dev/null \
+    && ok "Inner binary signed (library-validation disabled, dyld env allowed)"
+  rm -f "$ent"
+  # De-quarantine so Gatekeeper/AMFI don't block launch on other machines.
+  xattr -dr com.apple.quarantine "${CUA_APP}" 2>/dev/null || true
+  if codesign --verify "${BINARY}" 2>/dev/null; then
+    ok "Signature verification passed"
+  else
+    warn "Signature verify warning (non-fatal — nested re-sign breaks the outer bundle seal, which we don't rely on)"
+  fi
+}
+
 # ── main ───────────────────────────────────────────────────────────────
 
 main() {
@@ -324,53 +370,18 @@ EOF
       fi
     done
 
-    # 3c. Re-sign
-    info ""
-    info "3c. Re-signing bundles…"
-    # Entitlements that let a non-Codex caller inject team_hook.dylib:
-    #   - disable-library-validation: load the ad-hoc dylib despite the
-    #     team-id mismatch (else the process is SIGKILL'd "Code Signature
-    #     Invalid" the moment the hook is injected).
-    #   - allow-dyld-environment-variables: honor DYLD_INSERT_LIBRARIES under
-    #     hardened runtime.
-    # We deliberately DROP the binary's original entitlements instead of
-    # --preserve-metadata: ad-hoc + restricted `com.apple.private.*`
-    # entitlements is rejected by AMFI on newer macOS (error -424/-427).
-    # Trade-off: on very new macOS this can reduce the deeper Service
-    # capability (get_app_state may hit -10005); list_apps / the hook still work.
-    local ent; ent="$(mktemp -t cua_ent).plist"
-    cat > "$ent" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>com.apple.security.cs.disable-library-validation</key><true/>
-  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
-</dict>
-</plist>
-PLIST
-    detail "Signing outer app (Codex Computer Use.app) with --deep…"
-    codesign -s - --force --deep "${CUA_APP}" 2>/dev/null
-    ok "Outer app signed"
-    # Sign the launched inner binary LAST so it keeps the entitlements above.
-    detail "Signing inner binary with injection-permitting entitlements…"
-    codesign -s - --force --entitlements "$ent" "${INNER_APP}" 2>/dev/null
-    ok "Inner app signed (library-validation disabled, dyld env allowed)"
-    rm -f "$ent"
-    # De-quarantine so Gatekeeper/AMFI don't block launch on other machines.
-    xattr -dr com.apple.quarantine "${CUA_APP}" 2>/dev/null || true
-    detail "Verifying signature…"
-    if codesign --verify "${BINARY}" 2>/dev/null; then
-      ok "Signature verification passed"
-    else
-      warn "Signature verification warning (non-fatal — the nested re-sign breaks the outer bundle seal, which we don't rely on)"
-    fi
+    # (Re-signing happens unconditionally in resign_binary below, so a re-run
+    # on an already-patched binary still gets the current signing strategy.)
     info ""
     ok "${GREEN}Patches applied successfully!${RESET}"
   else
     info ""
     ok "${GREEN}All patches already applied.${RESET}"
   fi
+
+  # 3d. Re-sign for hook injection — ALWAYS, even if already patched, so a
+  # re-run upgrades the signing on machines patched by an older installer.
+  resign_binary
 
   # 4. Register the MCP server with agent clients
   register_mcp_server "$BINARY"
