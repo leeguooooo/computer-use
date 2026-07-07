@@ -1,0 +1,11 @@
+.build/
+.build-arm64/
+.build-x86_64/
+.build-debug/
+.build-release/
+.build/**/binary
+.build/**/Modules
+Package.resolved
+.DS_Store
+*.bak
+*.bak.*
