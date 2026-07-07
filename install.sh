@@ -274,12 +274,19 @@ PLIST
   # disable-library-validation that child is killed loading the ad-hoc hook
   # (AMFI -423 → the client reports -10005). Sign deepest-path first so the
   # nested executables' seals settle before their containers'.
+  # NOTE: no process substitution here — `curl | sh` runs under bash's POSIX
+  # mode, which disables `< <(...)`. Use a temp file + redirect instead (also
+  # keeps the loop in the current shell so the counter survives, and handles
+  # the spaces in "Codex Computer Use.app").
   local signed=0 f
+  local list; list="$(mktemp -t cua_macho)"
+  find "${CUA_APP}" -type f -path '*/Contents/MacOS/*' | awk '{print length"\t"$0}' | sort -rn | cut -f2- > "$list"
   while IFS= read -r f; do
     if file "$f" 2>/dev/null | grep -q "Mach-O"; then
       codesign -s - --force --entitlements "$ent" "$f" 2>/dev/null && signed=$((signed+1))
     fi
-  done < <(find "${CUA_APP}" -type f -path '*/Contents/MacOS/*' | awk '{print length"\t"$0}' | sort -rn | cut -f2-)
+  done < "$list"
+  rm -f "$list"
   ok "Signed ${signed} bundle executable(s) with injection entitlements (incl. SkyComputerUseService)"
   rm -f "$ent"
   # De-quarantine so Gatekeeper/AMFI don't block launch on other machines.
