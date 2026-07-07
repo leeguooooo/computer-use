@@ -85,7 +85,11 @@ Validated across three machines (author + two collaborating agents):
 | 15.x (Sonoma / Sequoia) | ✅ | ✅ | ✅ full — verified end-to-end |
 | 26 / 27 (Tahoe) | ✅ | ✅ | ⛔ blocked by the OS |
 
-The sender-auth hook is **portable** — `list_apps` returns real data with no `-10000` on every machine tested, which proves the bypass itself works. But on **macOS 26/27**, `get_app_state` / `click` fail (`-10005`, `SkyComputerUseService not valid -423`): the Service child process needs restricted private entitlements (`com.apple.private.tcc.manager.*`) to do the AX/TCC work, and ad-hoc signing can't provide them — keep them and AMFI rejects ad-hoc+restricted (`-424`); strip them and the Service is denied system access (`-423` → `-10005`). Getting past this on 26/27 would need relaxing SIP/AMFI (`csrutil` / `amfi_get_out_of_my_way`, not recommended) or a real Apple signing certificate. **Treat macOS 26/27 as `list_apps`-only for now.**
+The sender-auth hook is **portable** — `list_apps` returns real data with no `-10000` on every machine tested, which proves the bypass itself works. The rest depends on how strictly the machine enforces code signing:
+
+- **Full function** needs one *consistent* ad-hoc `--deep` signature across the bundle (the installer default). Re-signing pieces separately or stripping entitlements breaks the client↔Service handshake → `get_app_state` returns `-10005`. Keep the default signing.
+- **Enforced library validation** (the ad-hoc `team_hook.dylib` gets SIGKILL'd "Code Signature Invalid", seen on some macOS 15.x): re-run with **`CUA_HOOK_ENTITLEMENTS=1`**, which merges `com.apple.security.cs.disable-library-validation` + `allow-dyld-environment-variables` onto the launched binaries so the hook loads. Off by default — on newer macOS it can trade away `get_app_state`.
+- **macOS 26/27 (Tahoe)**: `list_apps`-only. `get_app_state` / `click` fail (`-10005`, `SkyComputerUseService not valid -423`) because the Service needs restricted private entitlements (`com.apple.private.tcc.manager.*`) that ad-hoc signing can't carry (keep → AMFI `-424`; strip → `-423`/denied). Getting past this needs relaxing SIP/AMFI (`csrutil` / `amfi_get_out_of_my_way`, not recommended) or a real Apple cert.
 
 The installer avoids POSIX-incompatible shell syntax, so `curl … | sh` (bash POSIX mode) works as-is.
 

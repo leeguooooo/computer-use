@@ -85,7 +85,11 @@ b.ne   …                    ; ← 替换为 NOP
 | 15.x(Sonoma / Sequoia) | ✅ | ✅ | ✅ 完整,端到端跑通 |
 | 26 / 27(Tahoe) | ✅ | ✅ | ⛔ 被系统挡住 |
 
-sender 认证 hook 是**可移植**的 —— 每台机器上 `list_apps` 都能返回真实数据、无 `-10000`,绕过本身成立。但在 **macOS 26/27** 上,`get_app_state` / 点击会失败(`-10005`、`SkyComputerUseService not valid -423`):子进程 Service 要干 AX/TCC 的活,必须带受限私有 entitlements(`com.apple.private.tcc.manager.*`),而 ad-hoc 签名给不了 —— 保留 → AMFI 拒 ad-hoc+受限(`-424`);剥掉 → Service 拿不到系统权限(`-423` → `-10005`)。要在 26/27 上过这道,只能放松 SIP/AMFI(`csrutil` / `amfi_get_out_of_my_way`,不建议)或用真 Apple 签名证书。**macOS 26/27 目前按「只支持 list_apps」对待。**
+sender 认证 hook 是**可移植**的 —— 每台机器上 `list_apps` 都能返回真实数据、无 `-10000`,绕过本身成立。剩下的取决于机器对代码签名有多严:
+
+- **完整功能**需要整个 bundle 用**一致的** ad-hoc `--deep` 签名(安装脚本默认就是)。分开重签或剥掉 entitlements 会破坏 client↔Service 握手 → `get_app_state` 返回 `-10005`。别改默认签名。
+- **强制库校验的机器**(ad-hoc `team_hook.dylib` 被 SIGKILL「Code Signature Invalid」,部分 macOS 15.x 会):用 **`CUA_HOOK_ENTITLEMENTS=1`** 重跑,它会把 `com.apple.security.cs.disable-library-validation` + `allow-dyld-environment-variables` **合并**进被启动的二进制,让 hook 能加载。默认不开 —— 在较新 macOS 上它可能牺牲掉 `get_app_state`。
+- **macOS 26/27(Tahoe)**:只支持 `list_apps`。`get_app_state` / 点击失败(`-10005`、`SkyComputerUseService not valid -423`),因为 Service 要带受限私有 entitlements(`com.apple.private.tcc.manager.*`),ad-hoc 签名给不了(保留 → AMFI `-424`;剥掉 → `-423`/无权限)。要过这道只能放松 SIP/AMFI(`csrutil` / `amfi_get_out_of_my_way`,不建议)或用真 Apple 证书。
 
 安装脚本避开了 POSIX 不兼容的 shell 语法,所以 `curl … | sh`(bash POSIX 模式)可直接用。
 
