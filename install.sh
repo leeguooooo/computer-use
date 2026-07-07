@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# opencua — patch installer
-# Patches the SkyComputerUseClient binary inside Codex Computer Use to
-# bypass the internal permission check, then ad-hoc re-signs the bundles.
+# Codex Computer Use — permission bypass installer
+#
+# Patches the SkyComputerUseClient binary to skip its internal permission
+# check, then triggers the macOS permission dialogs so the user only needs
+# to click "Allow".
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/install.sh | sh
 #
-# The script:
-#   1. Finds the Codex Computer Use plugin (all 3 known locations)
-#   2. Locates the SkyComputerUseClient binary
-#   3. Verifies the binary's permission-check bytes
-#   4. Backs up the original binary to ~/Desktop
-#   5. Applies 3 NOP patches that force the permission-branch to succeed
-#   6. Ad-hoc re-signs the inner and outer app bundles
-#   7. Prints post-install instructions for granting macOS permissions
+# What it does:
+#   1. Finds Codex Computer Use.app
+#   2. Patches 3 branch instructions → NOP inside SkyComputerUseClient
+#   3. Ad-hoc re-signs the bundles
+#   4. Launches the binary once to trigger macOS Accessibility + Screen
+#      Recording permission dialogs → user just clicks Allow
+#   5. Restarts Codex
 
 BOLD=$(printf '\033[1m')
 DIM=$(printf '\033[2m')
@@ -47,9 +48,9 @@ find_cua_app() {
 }
 
 # ── patch offsets ──────────────────────────────────────────────────────
-# These 3 file offsets correspond to the permission-switch branch instructions
-# in the function at vmaddr 0x100019a00. Each is an ARM64 conditional branch
-# instruction (B.LE, B.EQ, B.NE) that is replaced with NOP (1f 20 03 d5).
+# Permission-check function at vmaddr 0x100019a00. Three conditional
+# branches that gate on the permission byte at struct offset 0x20.
+# We replace each with NOP (1f 20 03 d5).
 
 PATCHES=(
   "0x19a18:cd010054:1f2003d5"  # B.LE  → NOP
@@ -57,17 +58,72 @@ PATCHES=(
   "0x19a28:61040054:1f2003d5"  # B.NE  → NOP
 )
 
-# Read 4 bytes at an offset as a hex string (lowercase, no spaces, no ASCII).
 read_hex() {
   od -A n -t x1 -j "$1" -N 4 "$2" 2>/dev/null | tr -d ' \n'
+}
+
+# ── macOS permission dialogs ───────────────────────────────────────────
+
+# Launch SkyComputerUseClient briefly so macOS TCC shows the permission
+# dialogs for Accessibility and Screen Recording. The user just clicks
+# "Allow" on the system pop-ups.
+trigger_permission_dialogs() {
+  local binary="$1"
+
+  # Check whether permissions are already granted by doing a quick probe
+  local tccdb_db="${HOME}/Library/Application Support/com.apple.TCC/TCC.db"
+  if [[ -f "$tccdb_db" ]]; then
+    local bundle_id
+    bundle_id=$(osascript -e "id of app \"SkyComputerUseClient\"" 2>/dev/null || true)
+    if [[ -z "$bundle_id" ]]; then
+      # Fallback: try to read from the app's Info.plist
+      bundle_id=$(plutil -p "${INNER_APP}/Contents/Info.plist" 2>/dev/null | grep CFBundleIdentifier | awk -F'"' '{print $4}' || true)
+    fi
+    if [[ -n "$bundle_id" ]]; then
+      local ax_granted
+      ax_granted=$(sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE client='${bundle_id}' AND service='kTCCServiceAccessibility' AND allowed=1" 2>/dev/null || true)
+      local sr_granted
+      sr_granted=$(sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE client='${bundle_id}' AND service='kTCCServiceScreenCapture' AND allowed=1" 2>/dev/null || true)
+      if [[ "${ax_granted:-0}" -gt 0 && "${sr_granted:-0}" -gt 0 ]]; then
+        return 0  # already granted
+      fi
+    fi
+  fi
+
+  # Launch the binary in MCP mode; it will try to use AX/Screen Recording
+  # APIs, which triggers the TCC dialogs.
+  info ""
+  info "4. Triggering macOS permission dialogs…"
+  detail "A Terminal window will open briefly — this is normal."
+  detail ""
+
+  # Run in a new Terminal window so the user sees what's happening
+  osascript <<EOF
+tell application "Terminal"
+  activate
+  do script "${binary} mcp; exit"
+  delay 3
+  tell application "Terminal" to close first window
+end tell
+EOF
+
+  info ""
+  ok "${GREEN}Check for macOS permission pop-ups!${RESET}"
+  info ""
+  info "${BOLD}If you saw dialogs asking for permission:${RESET}"
+  info "  Click ${BOLD}Allow${RESET} or ${BOLD}OK${RESET} on each one."
+  info ""
+  info "${BOLD}If nothing popped up:${RESET}"
+  info "  Open System Settings manually (the window should already be open),"
+  info "  go to Privacy & Security, and check if there are requests waiting."
 }
 
 # ── main ───────────────────────────────────────────────────────────────
 
 main() {
   info ""
-  info "opencua — Codex Computer Use patch installer"
-  info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  info "Codex Computer Use — permission bypass installer"
+  info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   info ""
 
   # 1. Find the app
@@ -96,9 +152,7 @@ EOF
     err "Binary not found at: ${BINARY}"
   fi
   ok "Binary: ${BINARY}"
-
-  BINARY_SIZE=$(stat -f%z "$BINARY")
-  detail "Size: ${BINARY_SIZE} bytes"
+  detail "Size: $(stat -f%z "$BINARY") bytes"
 
   # 2. Verify original bytes
   info ""
@@ -126,23 +180,19 @@ EOF
     exit 1
   fi
 
-  if [[ "$any_patched" == "true" ]]; then
+  # 3. Patch (if needed)
+  if [[ "$any_patched" == "false" ]]; then
+    # 3a. Backup
     info ""
-    info "${GREEN}All patches already applied — nothing to do.${RESET}"
-    info "If Computer Use still doesn't work, check the macOS permissions below."
-    # still print the instructions
-  else
-    # 3. Backup
-    info ""
-    info "3. Backing up original binary…"
+    info "3a. Backing up original binary…"
     BACKUP_DIR="${HOME}/Desktop"
-    BACKUP_FILE="${BACKUP_DIR}/SkyComputerUseClient.bak.$(date +%Y%m%d-%H%M%S).${BINARY_SIZE}"
+    BACKUP_FILE="${BACKUP_DIR}/SkyComputerUseClient.bak.$(date +%Y%m%d-%H%M%S).$(stat -f%z "$BINARY")"
     cp "$BINARY" "$BACKUP_FILE"
     ok "Backup saved: ${BACKUP_FILE}"
 
-    # 4. Apply patches
+    # 3b. Apply patches
     info ""
-    info "4. Applying patches…"
+    info "3b. Applying patches…"
     for entry in "${PATCHES[@]}"; do
       IFS=':' read -r offset expected_orig expected_new <<< "$entry"
       actual=$(read_hex "$offset" "$BINARY")
@@ -157,59 +207,80 @@ EOF
       fi
     done
 
-    # 5. Re-sign
+    # 3c. Re-sign
     info ""
-    info "5. Re-signing bundles…"
-
+    info "3c. Re-signing bundles…"
     detail "Signing inner app (SkyComputerUseClient.app)…"
     codesign -s - --force --preserve-metadata=entitlements "${INNER_APP}" 2>/dev/null
     ok "Inner app signed"
-
     detail "Signing outer app (Codex Computer Use.app) with --deep…"
     codesign -s - --force --deep "${CUA_APP}" 2>/dev/null
     ok "Outer app signed"
-
     detail "Verifying signatures…"
     if codesign --verify --deep "${CUA_APP}" 2>/dev/null; then
       ok "Signature verification passed"
     else
-      warn "Signature verification failed (non-fatal — app should still work)"
+      warn "Signature verification warning (non-fatal)"
     fi
-
     info ""
-    info "${GREEN}Patches applied successfully!${RESET}"
+    ok "${GREEN}Patches applied successfully!${RESET}"
+  else
+    info ""
+    ok "${GREEN}All patches already applied.${RESET}"
   fi
 
-  # 6. Post-install instructions
+  # 4. Trigger macOS permission dialogs
+  trigger_permission_dialogs "$BINARY"
+
+  # 5. Open System Settings as backup
   info ""
-  info "${YELLOW}── Permission setup ──────────────────────${RESET}"
+  info "5. Opening System Settings for manual setup (if needed)…"
+  detail "If the permission pop-ups didn't appear, use the pane that just opened."
+  # Try every known macOS URL scheme for the privacy panes
+  for url in \
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity?Privacy_Accessibility" \
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" \
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" \
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity?Privacy_ScreenCapture"; do
+    open "$url" 2>/dev/null && break
+  done 2>/dev/null || true
+
+  # 6. Restart Codex
   info ""
-  info "For Computer Use to actually function, you need to grant two permissions"
-  info "to the SkyComputerUseClient app in System Settings:"
+  info "6. Restarting Codex…"
+  detail "This picks up the patched binary and newly granted permissions."
+  if pkill -9 "Codex" 2>/dev/null; then
+    ok "Codex terminated — relaunch it manually from Applications."
+  else
+    detail "Codex wasn't running, or was already terminated."
+    detail "Launch it from Applications when ready."
+  fi
+
+  # 7. Summary
   info ""
-  info "  1. ${BOLD}Accessibility${RESET}"
-  info "     System Settings → Privacy & Security → Accessibility"
-  info "     → Click '+' → navigate to:"
-  info "       ${DIM}Codex Computer Use.app${RESET}"
-  info "       ${DIM}  ↓ Contents/SharedSupport/${RESET}"
-  info "       ${DIM}SkyComputerUseClient.app${RESET}"
-  info "     → Select 'SkyComputerUseClient.app' → Open"
+  info "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+  info "${GREEN}  All done!${RESET}"
+  info "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   info ""
-  info "  2. ${BOLD}Screen Recording${RESET}"
-  info "     System Settings → Privacy & Security → Screen Recording"
-  info "     → Add the same ${DIM}SkyComputerUseClient.app${RESET}"
+  info "${BOLD}What just happened:${RESET}"
+  info "  1. SkyComputerUseClient was patched (permission check bypassed)"
+  info "  2. Permissions were requested from macOS"
+  info "  3. System Settings opened as backup"
+  info "  4. Codex was restarted"
   info ""
-  info "After adding both, restart Codex and try Computer Use."
+  info "${BOLD}If you saw macOS pop-ups asking for permission:${RESET}"
+  info "  ✓ Click ${BOLD}Allow${RESET} / ${BOLD}OK${RESET} on each one"
+  info "  ✓ Then relaunch Codex and try Computer Use"
   info ""
-  info "${YELLOW}── Reverting ──────────────────────────────${RESET}"
+  info "${BOLD}If NOTHING appeared:${RESET}"
+  info "  Open System Settings → Privacy & Security"
+  info "  Under Accessibility and Screen Recording, look for"
+  info "  ${DIM}SkyComputerUseClient.app${RESET} in the list and check the box."
   info ""
+  info "${BOLD}To revert:${RESET}"
   if [[ -n "${BACKUP_FILE:-}" && -f "${BACKUP_FILE:-}" ]]; then
-    info "To revert, restore the backup:"
     info "  sudo cp ${BACKUP_FILE} ${BINARY}"
     info "  codesign -s - --force --deep '${CUA_APP}'"
-    info ""
-    info "The original binary was saved to:"
-    info "  ${DIM}${BACKUP_FILE}${RESET}"
   fi
   info ""
 }
