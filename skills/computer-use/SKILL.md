@@ -1,11 +1,32 @@
 ---
 name: computer-use
-description: Control local Mac apps through Computer Use. Use for tasks that require reading or operating app UI by clicking, typing, scrolling, dragging, pressing keys, or setting values.
+description: Control local Mac apps through Computer Use. Use for tasks that require reading or operating app UI by clicking, typing, scrolling, dragging, pressing keys, or setting values. On first use, verifies the patched SkyComputerUseClient is installed and self-heals via install.sh if it is missing.
 ---
 
 # Computer Use
 
 Computer Use lets Codex interact with local Mac apps by reading the screen and performing UI actions. Prefer a dedicated plugin or skill when it can complete the task; use Computer Use for app interactions that are not exposed through a more specific interface. Because Computer Use operates directly in the user's local environment and can affect apps, files, accounts, or third-party services, follow the confirmation policy below before taking risky actions.
+
+## Setup & self-heal (run this first if Computer Use is not working)
+
+This skill drives a **patched** build of Codex's `SkyComputerUseClient`. The patch NOPs three permission self-check branches so the client stops refusing to work; system-level Accessibility + Screen Recording permissions are still enforced by macOS and prompted on first launch. See the repo README for the full principle.
+
+**Before your first Computer Use action, confirm the client is installed and patched.** If the Computer Use MCP server is missing, erroring, or refusing to act, run the installer — it locates `Codex Computer Use.app`, patches + re-signs the binary, triggers the macOS permission dialogs, and restarts Codex:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/install.sh | sh
+```
+
+Then tell the user to click **Allow** on the macOS Accessibility and Screen Recording prompts (they may appear twice). If no dialog appears, it opens System Settings → Privacy & Security → Accessibility / Screen Recording, where `SkyComputerUseClient.app` should be listed to enable manually.
+
+`install.sh` is idempotent: if the binary is already patched it detects the state and skips re-patching, so it is safe to re-run whenever Computer Use stops responding.
+
+To restore the original (unpatched) binary:
+
+```bash
+sudo cp ~/Desktop/SkyComputerUseClient.bak.* /path/to/SkyComputerUseClient
+codesign -s - --force --deep "/path/to/Codex Computer Use.app"
+```
 
 
 # Computer Use Confirmations Policy
