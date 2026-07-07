@@ -81,9 +81,14 @@ trigger_permission_dialogs() {
     fi
     if [[ -n "$bundle_id" ]]; then
       local ax_granted
-      ax_granted=$(sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE client='${bundle_id}' AND service='kTCCServiceAccessibility' AND allowed=1" 2>/dev/null || true)
+      # Newer macOS TCC.db uses the `auth_value` column (2 = allowed); older
+      # builds used `allowed`. Try the new schema first, fall back to the old
+      # one — querying a missing column errors with "no such column".
+      ax_granted=$(sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE client='${bundle_id}' AND service='kTCCServiceAccessibility' AND auth_value>=2" 2>/dev/null \
+        || sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE client='${bundle_id}' AND service='kTCCServiceAccessibility' AND allowed=1" 2>/dev/null || true)
       local sr_granted
-      sr_granted=$(sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE client='${bundle_id}' AND service='kTCCServiceScreenCapture' AND allowed=1" 2>/dev/null || true)
+      sr_granted=$(sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE client='${bundle_id}' AND service='kTCCServiceScreenCapture' AND auth_value>=2" 2>/dev/null \
+        || sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE client='${bundle_id}' AND service='kTCCServiceScreenCapture' AND allowed=1" 2>/dev/null || true)
       if [[ "${ax_granted:-0}" -gt 0 && "${sr_granted:-0}" -gt 0 ]]; then
         return 0  # already granted
       fi
@@ -322,17 +327,43 @@ EOF
     # 3c. Re-sign
     info ""
     info "3c. Re-signing bundles…"
-    detail "Signing inner app (SkyComputerUseClient.app)…"
-    codesign -s - --force --preserve-metadata=entitlements "${INNER_APP}" 2>/dev/null
-    ok "Inner app signed"
+    # Entitlements that let a non-Codex caller inject team_hook.dylib:
+    #   - disable-library-validation: load the ad-hoc dylib despite the
+    #     team-id mismatch (else the process is SIGKILL'd "Code Signature
+    #     Invalid" the moment the hook is injected).
+    #   - allow-dyld-environment-variables: honor DYLD_INSERT_LIBRARIES under
+    #     hardened runtime.
+    # We deliberately DROP the binary's original entitlements instead of
+    # --preserve-metadata: ad-hoc + restricted `com.apple.private.*`
+    # entitlements is rejected by AMFI on newer macOS (error -424/-427).
+    # Trade-off: on very new macOS this can reduce the deeper Service
+    # capability (get_app_state may hit -10005); list_apps / the hook still work.
+    local ent; ent="$(mktemp -t cua_ent).plist"
+    cat > "$ent" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+</dict>
+</plist>
+PLIST
     detail "Signing outer app (Codex Computer Use.app) with --deep…"
     codesign -s - --force --deep "${CUA_APP}" 2>/dev/null
     ok "Outer app signed"
-    detail "Verifying signatures…"
-    if codesign --verify --deep "${CUA_APP}" 2>/dev/null; then
+    # Sign the launched inner binary LAST so it keeps the entitlements above.
+    detail "Signing inner binary with injection-permitting entitlements…"
+    codesign -s - --force --entitlements "$ent" "${INNER_APP}" 2>/dev/null
+    ok "Inner app signed (library-validation disabled, dyld env allowed)"
+    rm -f "$ent"
+    # De-quarantine so Gatekeeper/AMFI don't block launch on other machines.
+    xattr -dr com.apple.quarantine "${CUA_APP}" 2>/dev/null || true
+    detail "Verifying signature…"
+    if codesign --verify "${BINARY}" 2>/dev/null; then
       ok "Signature verification passed"
     else
-      warn "Signature verification warning (non-fatal)"
+      warn "Signature verification warning (non-fatal — the nested re-sign breaks the outer bundle seal, which we don't rely on)"
     fi
     info ""
     ok "${GREEN}Patches applied successfully!${RESET}"
