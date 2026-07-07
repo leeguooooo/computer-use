@@ -1,6 +1,6 @@
 # Codex Computer Use — 权限绕过补丁
 
-对 OpenAI Codex 内置的「电脑使用」（Computer Use）插件做二进制定制，绕过其内部的权限自检，让它在 macOS 上正常工作。
+对 OpenAI Codex 内置的「电脑使用」（Computer Use）插件做定制，让它在 macOS 上、以及 **Codex 以外的 agent（Claude Code 等）里**也能用。核心是越过客户端的 **sender 身份认证**（用一个 DYLD hook，不改二进制），并把它注册成通用 MCP server。
 
 ## 使用
 
@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/instal
 
 1. **定位** `Codex Computer Use.app`（依次检查 3 个已知位置）
 2. **验证** 二进制版本，备份原始文件
-3. **打补丁** —— 把 3 条权限检查分支指令替换为 NOP
+3. **打补丁** —— 把 3 条分支指令替换为 NOP（历史遗留，实为装饰性；详见「原理：两道门」）
 4. **重签名** —— ad-hoc 签名内外两层 app bundle
 5. **编译 sender-auth hook** —— 构建 `team_hook.dylib`（见下「第二道门」）
 6. **注册 MCP** —— 把二进制注册成 MCP server 并注入 hook，让 **Codex 以外的 agent（Claude Code 等）也能用**。检测到 `claude` CLI 时自动 `claude mcp add`（user scope，带 `DYLD_INSERT_LIBRARIES`）
@@ -45,33 +45,42 @@ sudo cp ~/Desktop/SkyComputerUseClient.bak.* /path/to/SkyComputerUseClient
 codesign -s - --force --deep /path/to/Codex\ Computer\ Use.app
 ```
 
-## 原理
+## 原理：两道门
 
-`SkyComputerUseClient` 内部有一段权限自检逻辑：
+让非 Codex 的 agent 用上 Computer Use，需要越过**两道**关卡。
+
+### 第一道：权限自检 NOP（其实是装饰性的）
+
+历史上这个补丁把 `0x100019a00` 处三条条件分支改成 `NOP`：
 
 ```
-ldrb   w9, [x20, #0x20]    ; 读取权限状态字节
+ldrb   w9, [x20, #0x20]    ; 读取枚举 discriminator
 cmp    w9, #1
-b.le   error_handler        ; ≤1 → 拒绝工作    ← 替换为 NOP
+b.le   …                    ; ← 替换为 NOP
 cmp    w9, #2
-b.eq   continue             ; =2 → 继续        ← 替换为 NOP
+b.eq   …                    ; ← 替换为 NOP
 cmp    w9, #3
-b.ne   error_handler        ; ≠3 → 拒绝工作    ← 替换为 NOP
-; … 正常执行路径 …
+b.ne   …                    ; ← 替换为 NOP
 ```
 
-三处条件分支替换为 `NOP`（`1f 20 03 d5`）后，自检逻辑**始终走到成功路径**，不再因为权限状态字节异常而拒绝工作。
+**但经反汇编确认，`0x100019a00` 是 NSError 的 `description` getter**（读枚举 discriminator，返回对应错误文案），配套的 `0x1000197a8` 是 `_code` getter。这三个 NOP 只会**打乱报错文字**，并不 gate 任何权限——早期「自检始终走成功路径」的说法是错的。之所以在 Codex 里能用，是因为 Codex 本来就通过了第二道门。
 
-系统级权限（Accessibility + Screen Recording）由 macOS 内核和 `tccd` 强制，二进制自己无法绕过。补丁只移除了应用层「拒绝工作」的逻辑。补丁后首次启动会触发 macOS 系统权限弹窗，这是正常行为。
+### 第二道：sender 身份认证（真正的门）
+
+见上文「第二道门：sender 身份认证」一节。客户端用 `SecCodeCopySigningInformation` 取调用方 responsible 进程的 `kSecCodeInfoTeamIdentifier`，跟 OpenAI team `2DC432GLL2` 比对；不匹配就每个 tool 调用返回 `-10000`。用 `team_hook.dylib`（DYLD interpose）改写 team id 即可绕过，**不动二进制**。
+
+> 系统级权限（Accessibility + Screen Recording）由 macOS 内核和 `tccd` 强制，任何用户态手段都绕不过；补丁后首次启动触发的系统权限弹窗是正常行为，照常点「允许」。
 
 ## 技术细节
 
 | 项目 | 说明 |
 |---|---|
-| 目标文件 | `SkyComputerUseClient`（ARM64 Mach-O） |
-| 补丁函数 | `0x100019a00` — 权限状态分发 |
-| 结构体偏移 | `#0x20` — 权限状态字节 |
-| 补丁指令 | `1f 20 03 d5`（ARM64 NOP） |
+| 目标文件 | `SkyComputerUseClient`（ARM64 Mach-O，`~/.codex/computer-use/…`） |
+| `0x100019a00` | NSError **description getter**（错误文案映射，**非**权限门；老补丁的 3 个 NOP 落在这里） |
+| `0x1000197a8` | NSError `_code` getter（`senderNotAuthenticated → -10000`） |
+| 第二道门 | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` vs team `2DC432GLL2` |
+| 绕过方式 | `hook/team_hook.c` → `team_hook.dylib`，`DYLD_INSERT_LIBRARIES` 注入（`install.sh` 自动编译） |
+| NOP 指令 | `1f 20 03 d5`（ARM64 NOP） |
 | 验证哈希 | `b7ad461bd5ead8c51b1e5a83e38915f6338872778d35dcb6123b74e9df9dcc47`（11841728 字节版） |
 
 ## 附：opencua（实验性）

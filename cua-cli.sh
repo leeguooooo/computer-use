@@ -1,9 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_CUA="/Users/leo/.codex/plugins/cache/openai-bundled/computer-use/1.0.857/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
-CUA="${CUA:-$DEFAULT_CUA}"
+# Resolve the SkyComputerUseClient binary across known Codex install
+# locations (no hardcoded user or version). Override with CUA=/path.
+resolve_cua() {
+  local app
+  for app in \
+    "$HOME/.codex/computer-use/Codex Computer Use.app" \
+    "$HOME/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use/Codex Computer Use.app" \
+    "$HOME/.codex/plugins/cache/openai-bundled/computer-use/"*/"Codex Computer Use.app" \
+    "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"; do
+    if [[ -d "$app" ]]; then
+      echo "${app}/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+      return 0
+    fi
+  done
+  return 1
+}
+
+CUA="${CUA:-$(resolve_cua || true)}"
 CUA_WAIT_SECONDS="${CUA_WAIT_SECONDS:-5}"
+
+# The client rejects non-Codex callers ("-10000: Sender process is not
+# authenticated"). Injecting team_hook.dylib (built by install.sh) makes
+# tool calls pass the sender-authentication gate. Override with CUA_HOOK=.
+CUA_HOOK="${CUA_HOOK:-$HOME/.codex/computer-use/team_hook.dylib}"
+
+run_cua_mcp() {
+  if [[ -f "$CUA_HOOK" ]]; then
+    DYLD_INSERT_LIBRARIES="$CUA_HOOK" "$CUA" mcp
+  else
+    "$CUA" mcp
+  fi
+}
 
 usage() {
   cat <<'EOF'
@@ -28,7 +57,9 @@ Examples:
   ./cua-cli.sh raw get_app_state '{"app":"com.tencent.xinWeChat"}'
 
 Environment:
-  CUA=/path/to/SkyComputerUseClient  Override binary path.
+  CUA=/path/to/SkyComputerUseClient  Override binary path (auto-resolved by default).
+  CUA_HOOK=/path/to/team_hook.dylib  Sender-auth bypass hook (default: ~/.codex/computer-use/team_hook.dylib).
+  CUA_WAIT_SECONDS=5                 Seconds to keep stdin open for the reply.
 EOF
 }
 
@@ -66,7 +97,7 @@ call_mcp() {
       printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
       printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
       sleep "$CUA_WAIT_SECONDS"
-    } | "$CUA" mcp | jq 'select(.id==2)'
+    } | run_cua_mcp | jq 'select(.id==2)'
   else
     {
       printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cua-cli","version":"0"}}}'
@@ -74,7 +105,7 @@ call_mcp() {
       jq -nc --arg name "$tool_name" --argjson arguments "$payload_json" \
         '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:$name,arguments:$arguments}}'
       sleep "$CUA_WAIT_SECONDS"
-    } | "$CUA" mcp | jq 'select(.id==2)'
+    } | run_cua_mcp | jq 'select(.id==2)'
   fi
 }
 
