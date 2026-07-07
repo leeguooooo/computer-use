@@ -11,13 +11,24 @@ Computer Use lets Codex interact with local Mac apps by reading the screen and p
 
 This skill drives a **patched** build of Codex's `SkyComputerUseClient`. The patch NOPs three permission self-check branches so the client stops refusing to work; system-level Accessibility + Screen Recording permissions are still enforced by macOS and prompted on first launch. See the repo README for the full principle.
 
-**Before your first Computer Use action, confirm the client is installed and patched.** If the Computer Use MCP server is missing, erroring, or refusing to act, run the installer — it locates `Codex Computer Use.app`, patches + re-signs the binary, triggers the macOS permission dialogs, and restarts Codex:
+**Before your first Computer Use action, confirm the client is installed and patched.** If the Computer Use MCP server is missing, erroring, or refusing to act, run the installer — it locates `Codex Computer Use.app`, patches + re-signs the binary, **registers the patched binary as an MCP server**, triggers the macOS permission dialogs, and restarts Codex:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/install.sh | sh
 ```
 
 Then tell the user to click **Allow** on the macOS Accessibility and Screen Recording prompts (they may appear twice). If no dialog appears, it opens System Settings → Privacy & Security → Accessibility / Screen Recording, where `SkyComputerUseClient.app` should be listed to enable manually.
+
+### Using it outside Codex (Claude Code and other agents)
+
+Patching alone only unblocks Codex, whose plugin bundle already wires up the MCP server. Other agents also need the server registered — the installer does this automatically. If a `claude` CLI is on PATH, it runs:
+
+```bash
+claude mcp add mac-computer-use --scope user -- \
+  "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient" mcp
+```
+
+**The server MUST be named `mac-computer-use` (or anything except `computer-use`) — `computer-use` is a reserved MCP server name in Claude Code and is silently refused.** After registration, **restart the agent** so it picks up the new stdio server; the desktop-control tools (`list_apps`, `get_app_state`, `click`, `type_text`, `press_key`, `scroll`, `drag`, …) then become available. For other MCP clients (Cursor, Cline, Windsurf), add the same `command`/`args` stdio entry to their own config.
 
 `install.sh` is idempotent: if the binary is already patched it detects the state and skips re-patching, so it is safe to re-run whenever Computer Use stops responding.
 

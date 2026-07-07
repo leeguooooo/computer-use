@@ -16,9 +16,12 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/instal
 2. **验证** 二进制版本，备份原始文件
 3. **打补丁** —— 把 3 条权限检查分支指令替换为 NOP
 4. **重签名** —— ad-hoc 签名内外两层 app bundle
-5. **弹权限窗** —— 直接启动 `SkyComputerUseClient`，macOS 会自动弹出 Accessibility 和 Screen Recording 权限请求
-6. **打开系统设置** —— 如果弹窗没出现，作为备选
-7. **重启 Codex**
+5. **注册 MCP** —— 把补丁后的二进制注册成 MCP server，让 **Codex 以外的 agent（Claude Code 等）也能用**。检测到 `claude` CLI 时会自动 `claude mcp add`（user scope）
+6. **弹权限窗** —— 直接启动 `SkyComputerUseClient`，macOS 会自动弹出 Accessibility 和 Screen Recording 权限请求
+7. **打开系统设置** —— 如果弹窗没出现，作为备选
+8. **重启 Codex**
+
+> **⚠️ MCP server 名字必须是 `mac-computer-use`（或除 `computer-use` 外的任意名）** —— `computer-use` 在 Claude Code 里是**保留名**，会被静默拒绝加载。注册后**重启 agent** 才能加载这批桌面控制工具（`list_apps` / `click` / `type_text` / `press_key` …）。
 
 ### 之后
 

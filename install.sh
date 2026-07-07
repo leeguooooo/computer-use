@@ -93,7 +93,7 @@ trigger_permission_dialogs() {
   # Launch the binary in MCP mode; it will try to use AX/Screen Recording
   # APIs, which triggers the TCC dialogs.
   info ""
-  info "4. Triggering macOS permission dialogs…"
+  info "5. Triggering macOS permission dialogs…"
   detail "A Terminal window will open briefly — this is normal."
   detail ""
 
@@ -116,6 +116,56 @@ EOF
   info "${BOLD}If nothing popped up:${RESET}"
   info "  Open System Settings manually (the window should already be open),"
   info "  go to Privacy & Security, and check if there are requests waiting."
+}
+
+# ── register the MCP server with agent clients ─────────────────────────
+
+# The patched binary is itself a standalone MCP server (`… mcp` speaks
+# MCP over stdio). Patching alone doesn't help non-Codex agents — they
+# also need the server registered. Codex gets it from its plugin bundle;
+# Claude Code and friends need an explicit entry.
+#
+# NOTE: "computer-use" is a RESERVED MCP server name in Claude Code and
+# will not load, so we register under "mac-computer-use".
+MCP_SERVER_NAME="mac-computer-use"
+
+register_mcp_server() {
+  local binary="$1"
+
+  info ""
+  info "4. Registering Computer Use as an MCP server…"
+
+  local registered=false
+
+  # Claude Code (and Claude-compatible CLIs that ship `claude`)
+  if command -v claude >/dev/null 2>&1; then
+    # Idempotent: drop any prior entry, then add fresh at user scope so
+    # the tools are available across all projects.
+    claude mcp remove "$MCP_SERVER_NAME" --scope user >/dev/null 2>&1 || true
+    if claude mcp add "$MCP_SERVER_NAME" --scope user -- "$binary" mcp >/dev/null 2>&1; then
+      ok "Registered with Claude Code (user scope) as '${MCP_SERVER_NAME}'"
+      detail "Restart Claude Code for the new tools to appear."
+      registered=true
+    else
+      warn "Found the 'claude' CLI but registration failed — add it manually (snippet below)."
+    fi
+  fi
+
+  if [[ "$registered" == "false" ]]; then
+    detail "No 'claude' CLI on PATH — configure your agent manually (snippet below)."
+  fi
+
+  # Always print a manual snippet for other MCP clients (Cursor, Cline,
+  # Windsurf, etc.) — they each keep their own config file.
+  info ""
+  detail "For other MCP clients, add this stdio server to their config:"
+  cat <<EOF
+  "${MCP_SERVER_NAME}": {
+    "command": "${binary}",
+    "args": ["mcp"]
+  }
+EOF
+  detail "(Don't name it \"computer-use\" — that name is reserved in Claude Code.)"
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -229,12 +279,15 @@ EOF
     ok "${GREEN}All patches already applied.${RESET}"
   fi
 
-  # 4. Trigger macOS permission dialogs
+  # 4. Register the MCP server with agent clients
+  register_mcp_server "$BINARY"
+
+  # 5. Trigger macOS permission dialogs
   trigger_permission_dialogs "$BINARY"
 
-  # 5. Open System Settings as backup
+  # 6. Open System Settings as backup
   info ""
-  info "5. Opening System Settings for manual setup (if needed)…"
+  info "6. Opening System Settings for manual setup (if needed)…"
   detail "If the permission pop-ups didn't appear, use the pane that just opened."
   # Try every known macOS URL scheme for the privacy panes
   for url in \
@@ -245,9 +298,9 @@ EOF
     open "$url" 2>/dev/null && break
   done 2>/dev/null || true
 
-  # 6. Restart Codex
+  # 7. Restart Codex
   info ""
-  info "6. Restarting Codex…"
+  info "7. Restarting Codex…"
   detail "This picks up the patched binary and newly granted permissions."
   if pkill -9 "Codex" 2>/dev/null; then
     ok "Codex terminated — relaunch it manually from Applications."
@@ -256,7 +309,7 @@ EOF
     detail "Launch it from Applications when ready."
   fi
 
-  # 7. Summary
+  # 8. Summary
   info ""
   info "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   info "${GREEN}  All done!${RESET}"
@@ -264,9 +317,13 @@ EOF
   info ""
   info "${BOLD}What just happened:${RESET}"
   info "  1. SkyComputerUseClient was patched (permission check bypassed)"
-  info "  2. Permissions were requested from macOS"
-  info "  3. System Settings opened as backup"
-  info "  4. Codex was restarted"
+  info "  2. Registered as MCP server '${MCP_SERVER_NAME}' (for Claude Code / other agents)"
+  info "  3. Permissions were requested from macOS"
+  info "  4. System Settings opened as backup"
+  info "  5. Codex was restarted"
+  info ""
+  info "${BOLD}Using it outside Codex (e.g. Claude Code):${RESET}"
+  info "  Restart the agent, then the '${MCP_SERVER_NAME}' tools appear."
   info ""
   info "${BOLD}If you saw macOS pop-ups asking for permission:${RESET}"
   info "  ✓ Click ${BOLD}Allow${RESET} / ${BOLD}OK${RESET} on each one"
