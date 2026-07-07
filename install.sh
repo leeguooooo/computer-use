@@ -266,11 +266,21 @@ resign_binary() {
 </dict>
 </plist>
 PLIST
-  # Outer --deep first (clean ad-hoc baseline), then the inner binary LAST so
-  # it keeps the entitlements above.
+  # Outer --deep first (clean ad-hoc baseline + frameworks/resources).
   codesign -s - --force --deep "${CUA_APP}" 2>/dev/null && ok "Outer app signed"
-  codesign -s - --force --entitlements "$ent" "${INNER_APP}" 2>/dev/null \
-    && ok "Inner binary signed (library-validation disabled, dyld env allowed)"
+  # Then sign EVERY Mach-O executable in the bundle with the entitlements —
+  # not just the launched client. get_app_state forwards to a child app-server
+  # (SkyComputerUseService) that inherits DYLD_INSERT_LIBRARIES; without
+  # disable-library-validation that child is killed loading the ad-hoc hook
+  # (AMFI -423 → the client reports -10005). Sign deepest-path first so the
+  # nested executables' seals settle before their containers'.
+  local signed=0 f
+  while IFS= read -r f; do
+    if file "$f" 2>/dev/null | grep -q "Mach-O"; then
+      codesign -s - --force --entitlements "$ent" "$f" 2>/dev/null && signed=$((signed+1))
+    fi
+  done < <(find "${CUA_APP}" -type f -path '*/Contents/MacOS/*' | awk '{print length"\t"$0}' | sort -rn | cut -f2-)
+  ok "Signed ${signed} bundle executable(s) with injection entitlements (incl. SkyComputerUseService)"
   rm -f "$ent"
   # De-quarantine so Gatekeeper/AMFI don't block launch on other machines.
   xattr -dr com.apple.quarantine "${CUA_APP}" 2>/dev/null || true
