@@ -254,47 +254,46 @@ EOF
 # list_apps and the hook itself still work.
 resign_binary() {
   info ""
-  info "Re-signing for hook injection…"
-  local ent; ent="$(mktemp -t cua_ent).plist"
-  cat > "$ent" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>com.apple.security.cs.disable-library-validation</key><true/>
-  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
-</dict>
-</plist>
-PLIST
-  # Outer --deep first (clean ad-hoc baseline + frameworks/resources).
-  codesign -s - --force --deep "${CUA_APP}" 2>/dev/null && ok "Outer app signed"
-  # Then sign EVERY Mach-O executable in the bundle with the entitlements —
-  # not just the launched client. get_app_state forwards to a child app-server
-  # (SkyComputerUseService) that inherits DYLD_INSERT_LIBRARIES; without
-  # disable-library-validation that child is killed loading the ad-hoc hook
-  # (AMFI -423 → the client reports -10005). Sign deepest-path first so the
-  # nested executables' seals settle before their containers'.
-  # NOTE: no process substitution here — `curl | sh` runs under bash's POSIX
-  # mode, which disables `< <(...)`. Use a temp file + redirect instead (also
-  # keeps the loop in the current shell so the counter survives, and handles
-  # the spaces in "Codex Computer Use.app").
-  local signed=0 f
-  local list; list="$(mktemp -t cua_macho)"
-  find "${CUA_APP}" -type f -path '*/Contents/MacOS/*' | awk '{print length"\t"$0}' | sort -rn | cut -f2- > "$list"
-  while IFS= read -r f; do
-    if file "$f" 2>/dev/null | grep -q "Mach-O"; then
-      codesign -s - --force --entitlements "$ent" "$f" 2>/dev/null && signed=$((signed+1))
-    fi
-  done < "$list"
-  rm -f "$list"
-  ok "Signed ${signed} bundle executable(s) with injection entitlements (incl. SkyComputerUseService)"
-  rm -f "$ent"
-  # De-quarantine so Gatekeeper/AMFI don't block launch on other machines.
+  info "Re-signing…"
+  # DEFAULT: one CONSISTENT ad-hoc --deep over the whole bundle, preserving the
+  # original entitlements (app-groups/keychain/team-id). This is the config
+  # verified to give FULL function (list_apps AND get_app_state) on permissive
+  # macOS. Stripping entitlements or re-signing binaries piecemeal breaks the
+  # client↔Service handshake → get_app_state returns -10005. On permissive
+  # macOS the ad-hoc team_hook.dylib injects fine without extra entitlements.
+  codesign -s - --force --preserve-metadata=entitlements "${INNER_APP}" 2>/dev/null && ok "Inner app signed"
+  codesign -s - --force --deep "${CUA_APP}" 2>/dev/null && ok "Outer app signed (consistent seal)"
+
+  # OPT-IN for machines that enforce library validation (the ad-hoc hook gets
+  # SIGKILL'd "Code Signature Invalid", e.g. some macOS 15.x): add the two
+  # injection entitlements to the launched binaries, MERGED onto their existing
+  # entitlements (never stripped). Off by default because on newer macOS this
+  # can trade away get_app_state. Enable with CUA_HOOK_ENTITLEMENTS=1.
+  if [[ "${CUA_HOOK_ENTITLEMENTS:-0}" == "1" ]]; then
+    detail "CUA_HOOK_ENTITLEMENTS=1 — merging injection entitlements into launched binaries…"
+    local b
+    for b in "${BINARY}" "${CUA_APP}/Contents/MacOS/SkyComputerUseService"; do
+      [[ -f "$b" ]] || continue
+      local ent; ent="$(mktemp -t cua_ent).plist"
+      codesign -d --entitlements :- "$b" 2>/dev/null | tr -d '\0' > "$ent"
+      [[ -s "$ent" ]] || printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+        '<plist version="1.0"><dict></dict></plist>' > "$ent"
+      /usr/libexec/PlistBuddy -c "Delete :com.apple.security.cs.disable-library-validation" "$ent" >/dev/null 2>&1
+      /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.disable-library-validation bool true" "$ent" >/dev/null 2>&1
+      /usr/libexec/PlistBuddy -c "Delete :com.apple.security.cs.allow-dyld-environment-variables" "$ent" >/dev/null 2>&1
+      /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.allow-dyld-environment-variables bool true" "$ent" >/dev/null 2>&1
+      codesign -s - --force --entitlements "$ent" "$b" 2>/dev/null && ok "Merged injection entitlements: ${b##*/}"
+      rm -f "$ent"
+    done
+  fi
+
+  # De-quarantine so Gatekeeper doesn't block launch on a fresh machine.
   xattr -dr com.apple.quarantine "${CUA_APP}" 2>/dev/null || true
-  if codesign --verify "${BINARY}" 2>/dev/null; then
+  if codesign --verify --deep "${CUA_APP}" 2>/dev/null; then
     ok "Signature verification passed"
   else
-    warn "Signature verify warning (non-fatal — nested re-sign breaks the outer bundle seal, which we don't rely on)"
+    warn "Signature verify warning (non-fatal)"
   fi
 }
 
