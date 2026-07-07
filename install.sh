@@ -38,7 +38,7 @@ find_cua_app() {
     "$HOME/.codex/computer-use/Codex Computer Use.app" \
     "$HOME/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use/Codex Computer Use.app" \
     "$HOME/.codex/plugins/cache/openai-bundled/computer-use/"*/"Codex Computer Use.app" \
-    "/Applications/Codex.app/Contents/Resources/computer-use/"*/"Codex Computer Use.app"; do
+    "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"; do
     if [[ -d "$candidate" ]]; then
       echo "$candidate"
       return 0
@@ -249,7 +249,7 @@ main() {
     ~/.codex/computer-use/Codex Computer Use.app
     ~/.codex/.tmp/bundled-marketplaces/…/Codex Computer Use.app
     ~/.codex/plugins/cache/openai-bundled/computer-use/*/Codex Computer Use.app
-    /Applications/Codex.app/Contents/Resources/…/Codex Computer Use.app
+    /Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app
 
   Make sure Codex is installed and has been used at least once.
 EOF

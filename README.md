@@ -1,4 +1,4 @@
-# Codex Computer Use — 权限绕过补丁
+# Codex Computer Use — 让任意 agent 都能用（含 sender 认证绕过）
 
 对 OpenAI Codex 内置的「电脑使用」（Computer Use）插件做定制，让它在 macOS 上、以及 **Codex 以外的 agent（Claude Code 等）里**也能用。核心是越过客户端的 **sender 身份认证**（用一个 DYLD hook，不改二进制），并把它注册成通用 MCP server。
 
