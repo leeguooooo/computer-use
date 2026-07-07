@@ -21,14 +21,20 @@ Then tell the user to click **Allow** on the macOS Accessibility and Screen Reco
 
 ### Using it outside Codex (Claude Code and other agents)
 
-Patching alone only unblocks Codex, whose plugin bundle already wires up the MCP server. Other agents also need the server registered — the installer does this automatically. If a `claude` CLI is on PATH, it runs:
+There are **two** gates, and running outside Codex requires clearing both:
+
+1. **Registration** — Codex wires up the MCP server from its plugin bundle; other agents need an explicit entry. The name MUST be `mac-computer-use` (or anything except `computer-use` — that name is reserved in Claude Code and silently refused).
+2. **Sender authentication** — the client authenticates its caller by resolving the responsible process and checking its code-signature team id (via `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier`) against OpenAI's Apple team `2DC432GLL2`. A non-Codex caller fails **every tool call** with error `-10000 "Sender process is not authenticated"`. (Note: the three-NOP binary patch does **not** touch this gate — it patches the cosmetic error-*description* getter.)
+
+The installer clears both: it builds a tiny DYLD interpose (`team_hook.dylib`) that rewrites the team id the gate sees, then registers the server with it injected. Equivalent to:
 
 ```bash
-claude mcp add mac-computer-use --scope user -- \
+claude mcp add mac-computer-use --scope user \
+  -e DYLD_INSERT_LIBRARIES="$HOME/.codex/computer-use/team_hook.dylib" -- \
   "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient" mcp
 ```
 
-**The server MUST be named `mac-computer-use` (or anything except `computer-use`) — `computer-use` is a reserved MCP server name in Claude Code and is silently refused.** After registration, **restart the agent** so it picks up the new stdio server; the desktop-control tools (`list_apps`, `get_app_state`, `click`, `type_text`, `press_key`, `scroll`, `drag`, …) then become available. For other MCP clients (Cursor, Cline, Windsurf), add the same `command`/`args` stdio entry to their own config.
+After registration, **restart the agent** so it picks up the new stdio server; the desktop-control tools (`list_apps`, `get_app_state`, `click`, `type_text`, `press_key`, `scroll`, `drag`, …) then become available. For other MCP clients (Cursor, Cline, Windsurf), add the same `command`/`args`/`env` stdio entry to their own config — the `DYLD_INSERT_LIBRARIES` env is what makes tool calls pass the sender gate.
 
 `install.sh` is idempotent: if the binary is already patched it detects the state and skips re-patching, so it is safe to re-run whenever Computer Use stops responding.
 

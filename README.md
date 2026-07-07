@@ -16,12 +16,21 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/instal
 2. **验证** 二进制版本，备份原始文件
 3. **打补丁** —— 把 3 条权限检查分支指令替换为 NOP
 4. **重签名** —— ad-hoc 签名内外两层 app bundle
-5. **注册 MCP** —— 把补丁后的二进制注册成 MCP server，让 **Codex 以外的 agent（Claude Code 等）也能用**。检测到 `claude` CLI 时会自动 `claude mcp add`（user scope）
-6. **弹权限窗** —— 直接启动 `SkyComputerUseClient`，macOS 会自动弹出 Accessibility 和 Screen Recording 权限请求
-7. **打开系统设置** —— 如果弹窗没出现，作为备选
-8. **重启 Codex**
+5. **编译 sender-auth hook** —— 构建 `team_hook.dylib`（见下「第二道门」）
+6. **注册 MCP** —— 把二进制注册成 MCP server 并注入 hook，让 **Codex 以外的 agent（Claude Code 等）也能用**。检测到 `claude` CLI 时自动 `claude mcp add`（user scope，带 `DYLD_INSERT_LIBRARIES`）
+7. **弹权限窗** —— 直接启动 `SkyComputerUseClient`，macOS 会自动弹出 Accessibility 和 Screen Recording 权限请求
+8. **打开系统设置** —— 如果弹窗没出现，作为备选
+9. **重启 Codex**
 
 > **⚠️ MCP server 名字必须是 `mac-computer-use`（或除 `computer-use` 外的任意名）** —— `computer-use` 在 Claude Code 里是**保留名**，会被静默拒绝加载。注册后**重启 agent** 才能加载这批桌面控制工具（`list_apps` / `click` / `type_text` / `press_key` …）。
+
+### 第二道门：sender 身份认证（`team_hook.dylib`）
+
+除了权限自检，`SkyComputerUseClient` 还有一道**调用方身份认证**：它解析调用方的 responsible 进程，用 `SecCodeCopySigningInformation` 取 `kSecCodeInfoTeamIdentifier`，跟 OpenAI 的 Apple team `2DC432GLL2` 比对。非 Codex 调用方（Claude Code）会让**每个 tool 调用**都返回 `-10000 "Sender process is not authenticated"`。
+
+绕过方式**不是**打二进制补丁，而是注入一个极小的 DYLD interpose（`hook/team_hook.c` → `team_hook.dylib`）：它 hook `SecCodeCopySigningInformation`，把返回字典里的 team id 改写成 `2DC432GLL2`，让这道门始终看到 OpenAI 的签名。用 `DYLD_INSERT_LIBRARIES` 注入即可，`install.sh` 会自动编译并在注册 MCP 时带上。
+
+> **注**：README 顶部那个「三处分支改 NOP」的补丁其实**只动了错误信息的描述函数**（`0x100019a00` 是 NSError 的 description getter），并不 gate 这道 sender 认证——真正让非 Codex 能用的是这个 hook。
 
 ### 之后
 
