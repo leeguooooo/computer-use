@@ -76,6 +76,19 @@ See *Gate two* above. The client reads the caller's responsible-process `kSecCod
 
 > System-level permissions (Accessibility + Screen Recording) are enforced by the macOS kernel and `tccd` — no userspace trick bypasses those. The system permission prompt on first launch after patching is expected; just click Allow.
 
+## macOS support & known limitations
+
+Validated across three machines (author + two collaborating agents):
+
+| macOS | install / patch / build hook | `list_apps` (no `-10000`) | `get_app_state` / click |
+|---|---|---|---|
+| 15.x (Sonoma / Sequoia) | ✅ | ✅ | ✅ full — verified end-to-end |
+| 26 / 27 (Tahoe) | ✅ | ✅ | ⛔ blocked by the OS |
+
+The sender-auth hook is **portable** — `list_apps` returns real data with no `-10000` on every machine tested, which proves the bypass itself works. But on **macOS 26/27**, `get_app_state` / `click` fail (`-10005`, `SkyComputerUseService not valid -423`): the Service child process needs restricted private entitlements (`com.apple.private.tcc.manager.*`) to do the AX/TCC work, and ad-hoc signing can't provide them — keep them and AMFI rejects ad-hoc+restricted (`-424`); strip them and the Service is denied system access (`-423` → `-10005`). Getting past this on 26/27 would need relaxing SIP/AMFI (`csrutil` / `amfi_get_out_of_my_way`, not recommended) or a real Apple signing certificate. **Treat macOS 26/27 as `list_apps`-only for now.**
+
+The installer avoids POSIX-incompatible shell syntax, so `curl … | sh` (bash POSIX mode) works as-is.
+
 ## Technical details
 
 | Item | Detail |

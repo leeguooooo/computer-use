@@ -76,6 +76,19 @@ b.ne   …                    ; ← 替换为 NOP
 
 > 系统级权限（Accessibility + Screen Recording）由 macOS 内核和 `tccd` 强制，任何用户态手段都绕不过；补丁后首次启动触发的系统权限弹窗是正常行为，照常点「允许」。
 
+## macOS 支持 / 已知限制
+
+在三台机器上验证过(作者 + 两个协作 agent):
+
+| macOS | 安装 / 打补丁 / 编 hook | `list_apps`(无 `-10000`) | `get_app_state` / 点击 |
+|---|---|---|---|
+| 15.x(Sonoma / Sequoia) | ✅ | ✅ | ✅ 完整,端到端跑通 |
+| 26 / 27(Tahoe) | ✅ | ✅ | ⛔ 被系统挡住 |
+
+sender 认证 hook 是**可移植**的 —— 每台机器上 `list_apps` 都能返回真实数据、无 `-10000`,绕过本身成立。但在 **macOS 26/27** 上,`get_app_state` / 点击会失败(`-10005`、`SkyComputerUseService not valid -423`):子进程 Service 要干 AX/TCC 的活,必须带受限私有 entitlements(`com.apple.private.tcc.manager.*`),而 ad-hoc 签名给不了 —— 保留 → AMFI 拒 ad-hoc+受限(`-424`);剥掉 → Service 拿不到系统权限(`-423` → `-10005`)。要在 26/27 上过这道,只能放松 SIP/AMFI(`csrutil` / `amfi_get_out_of_my_way`,不建议)或用真 Apple 签名证书。**macOS 26/27 目前按「只支持 list_apps」对待。**
+
+安装脚本避开了 POSIX 不兼容的 shell 语法,所以 `curl … | sh`(bash POSIX 模式)可直接用。
+
 ## 技术细节
 
 | 项目 | 说明 |
