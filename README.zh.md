@@ -22,18 +22,33 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/instal
 3. **打补丁** —— 把 3 条分支指令替换为 NOP（历史遗留，实为装饰性；详见「原理：两道门」）
 4. **重签名** —— ad-hoc 签名内外两层 app bundle
 5. **编译 sender-auth hook** —— 构建 `team_hook.dylib`（见下「第二道门」）
-6. **注册 MCP** —— 把二进制注册成 MCP server 并注入 hook，让 **Codex 以外的 agent（Claude Code 等）也能用**。检测到 `claude` CLI 时自动 `claude mcp add`（user scope，带 `DYLD_INSERT_LIBRARIES`）
+6. **注册 MCP** —— 把二进制注册成带 hook 的 MCP server，让 **Codex 和 Codex 以外的 agent（Claude Code 等）都走 hooked 路径**。脚本会在 `~/.codex/config.toml` 写入 `mac_computer_use`；检测到 `claude` CLI 时也会自动 `claude mcp add`（user scope，名字为 `mac-computer-use`，带 `DYLD_INSERT_LIBRARIES`）
 7. **弹权限窗** —— 直接启动 `SkyComputerUseClient`，macOS 会自动弹出 Accessibility 和 Screen Recording 权限请求
 8. **打开系统设置** —— 如果弹窗没出现，作为备选
 9. **重启 Codex**
 
-> **⚠️ MCP server 名字必须是 `mac-computer-use`（或除 `computer-use` 外的任意名）** —— `computer-use` 在 Claude Code 里是**保留名**，会被静默拒绝加载。注册后**重启 agent** 才能加载这批桌面控制工具（`list_apps` / `click` / `type_text` / `press_key` …）。
+> **⚠️ hooked MCP server 刻意不叫 `computer-use`。** `computer-use` 在 Claude Code 里是**保留名**，会被静默拒绝加载，所以 Claude Code 里使用 `mac-computer-use`。Codex 里写入 `~/.codex/config.toml` 的名字是 `mac_computer_use`。注册后**重启 agent** 才能加载这批桌面控制工具（`list_apps` / `get_app_state` / `click` / `type_text` / `press_key` …）。
+
+### Codex app 说明
+
+Codex 可能同时暴露内置的 `computer-use@openai-bundled` 插件。如果通过这个内置插件调用时出现 sender-auth 或 AppleEvent 错误，例如 `-10000`、`-1743` 或 `-1712`，请运行 installer 并重启 Codex，然后使用 hooked 的 `mac_computer_use` MCP server。installer 会写入类似下面的配置：
+
+```toml
+[mcp_servers.mac_computer_use]
+command = "/Users/you/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+args = ["mcp"]
+startup_timeout_sec = 120
+enabled = true
+
+[mcp_servers.mac_computer_use.env]
+DYLD_INSERT_LIBRARIES = "/Users/you/.codex/computer-use/team_hook.dylib"
+```
 
 ### 第二道门：sender 身份认证（`team_hook.dylib`）
 
-除了权限自检，`SkyComputerUseClient` 还有一道**调用方身份认证**：它解析调用方的 responsible 进程，用 `SecCodeCopySigningInformation` 取 `kSecCodeInfoTeamIdentifier`，跟 OpenAI 的 Apple team `2DC432GLL2` 比对。非 Codex 调用方（Claude Code）会让**每个 tool 调用**都返回 `-10000 "Sender process is not authenticated"`。
+除了权限自检，`SkyComputerUseClient` 还有一道**调用方身份认证**：它解析调用方的 responsible 进程，用 `SecCodeCopySigningInformation` 取 `kSecCodeInfoTeamIdentifier` 和 `kSecCodeInfoIdentifier`，跟 OpenAI 的 Apple team `2DC432GLL2` 以及 OpenAI bundle id 白名单比对。非 Codex 调用方（Claude Code）会让**每个 tool 调用**都返回 `-10000 "Sender process is not authenticated"`。
 
-绕过方式**不是**打二进制补丁，而是注入一个极小的 DYLD interpose（`hook/team_hook.c` → `team_hook.dylib`）：它 hook `SecCodeCopySigningInformation`，把返回字典里的 team id 改写成 `2DC432GLL2`，让这道门始终看到 OpenAI 的签名。用 `DYLD_INSERT_LIBRARIES` 注入即可，`install.sh` 会自动编译并在注册 MCP 时带上。
+绕过方式**不是**打二进制补丁，而是注入一个极小的 DYLD interpose（`hook/team_hook.c` → `team_hook.dylib`）：它 hook `SecCodeCopySigningInformation`，把返回字典里的 team id 和 bundle identifier 改写成允许的 OpenAI 调用方，让这道门始终看到 OpenAI 的签名。用 `DYLD_INSERT_LIBRARIES` 注入即可，`install.sh` 会自动编译并在注册 MCP 时带上。
 
 > **注**：上面第 3 步那个「三处分支改 NOP」的补丁其实**只动了错误信息的描述函数**（`0x100019a00` 是 NSError 的 description getter），并不 gate 这道 sender 认证——真正让非 Codex 能用的是这个 hook。
 
@@ -72,7 +87,7 @@ b.ne   …                    ; ← 替换为 NOP
 
 ### 第二道：sender 身份认证（真正的门）
 
-见上文「第二道门：sender 身份认证」一节。客户端用 `SecCodeCopySigningInformation` 取调用方 responsible 进程的 `kSecCodeInfoTeamIdentifier`，跟 OpenAI team `2DC432GLL2` 比对；不匹配就每个 tool 调用返回 `-10000`。用 `team_hook.dylib`（DYLD interpose）改写 team id 即可绕过，**不动二进制**。
+见上文「第二道门：sender 身份认证」一节。客户端用 `SecCodeCopySigningInformation` 取调用方 responsible 进程的 `kSecCodeInfoTeamIdentifier` 和 `kSecCodeInfoIdentifier`，跟 OpenAI team `2DC432GLL2` 以及 OpenAI bundle id 白名单比对；不匹配就每个 tool 调用返回 `-10000`。用 `team_hook.dylib`（DYLD interpose）改写这两个字段即可绕过，**不动二进制**。
 
 > 系统级权限（Accessibility + Screen Recording）由 macOS 内核和 `tccd` 强制，任何用户态手段都绕不过；补丁后首次启动触发的系统权限弹窗是正常行为，照常点「允许」。
 
@@ -100,19 +115,10 @@ sender 认证 hook 是**可移植**的 —— 每台机器上 `list_apps` 都能
 | 目标文件 | `SkyComputerUseClient`（ARM64 Mach-O，`~/.codex/computer-use/…`） |
 | `0x100019a00` | NSError **description getter**（错误文案映射，**非**权限门；老补丁的 3 个 NOP 落在这里） |
 | `0x1000197a8` | NSError `_code` getter（`senderNotAuthenticated → -10000`） |
-| 第二道门 | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` vs team `2DC432GLL2` |
+| 第二道门 | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` + `kSecCodeInfoIdentifier` vs OpenAI team 和 bundle id 白名单 |
 | 绕过方式 | `hook/team_hook.c` → `team_hook.dylib`，`DYLD_INSERT_LIBRARIES` 注入（`install.sh` 自动编译） |
 | NOP 指令 | `1f 20 03 d5`（ARM64 NOP） |
 | 验证哈希 | `b7ad461bd5ead8c51b1e5a83e38915f6338872778d35dcb6123b74e9df9dcc47`（11841728 字节版） |
-
-## 附：opencua（实验性）
-
-`Sources/opencua/` 目录包含一个从零实现的 macOS UI 自动化 MCP 服务器（Swift，~600 行），功能类似 SkyComputerUseClient。目前仍在实验阶段。
-
-```bash
-swift build -c release
-.build/release/opencua mcp
-```
 
 ## 边界声明
 

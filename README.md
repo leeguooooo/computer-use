@@ -22,18 +22,33 @@ The script automatically:
 3. **Patches** — replaces 3 branch instructions with NOPs (legacy step, actually cosmetic; see *How it works: two gates*).
 4. **Re-signs** — ad-hoc signs both the inner and outer app bundles.
 5. **Builds the sender-auth hook** — compiles `team_hook.dylib` (see *Gate two* below).
-6. **Registers the MCP server** — with the hook injected, so **non-Codex agents (Claude Code, etc.) can use it too**. If the `claude` CLI is present it runs `claude mcp add` at user scope with `DYLD_INSERT_LIBRARIES`.
+6. **Registers the MCP server** — with the hook injected, so **Codex and non-Codex agents (Claude Code, etc.) can use the hooked path**. It writes `~/.codex/config.toml` as `mac_computer_use`; if the `claude` CLI is present it also runs `claude mcp add` at user scope as `mac-computer-use` with `DYLD_INSERT_LIBRARIES`.
 7. **Triggers the permission dialogs** — launches `SkyComputerUseClient` so macOS prompts for Accessibility + Screen Recording.
 8. **Opens System Settings** — as a fallback if no dialog appears.
 9. **Restarts Codex.**
 
-> **⚠️ The MCP server must be named `mac-computer-use` (or anything except `computer-use`)** — `computer-use` is a **reserved** MCP server name in Claude Code and is silently refused. **Restart the agent** after registering so it loads the desktop-control tools (`list_apps` / `click` / `type_text` / `press_key` …).
+> **⚠️ The hooked MCP server is intentionally not named `computer-use`.** Claude Code reserves that name and silently refuses it, so the installer uses `mac-computer-use` there. Codex receives `mac_computer_use` in `~/.codex/config.toml`. **Restart the agent** after registering so it loads the desktop-control tools (`list_apps` / `get_app_state` / `click` / `type_text` / `press_key` …).
+
+### Codex app note
+
+Codex may also expose the bundled `computer-use@openai-bundled` plugin. If calls through that built-in plugin fail with sender-auth or AppleEvent errors such as `-10000`, `-1743`, or `-1712`, use the hooked `mac_computer_use` MCP server after running the installer and restarting Codex. The installer writes a config block like:
+
+```toml
+[mcp_servers.mac_computer_use]
+command = "/Users/you/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+args = ["mcp"]
+startup_timeout_sec = 120
+enabled = true
+
+[mcp_servers.mac_computer_use.env]
+DYLD_INSERT_LIBRARIES = "/Users/you/.codex/computer-use/team_hook.dylib"
+```
 
 ### Gate two: sender authentication (`team_hook.dylib`)
 
-Beyond the self-check, `SkyComputerUseClient` has a **caller authentication** step: it resolves the caller's responsible process, reads `kSecCodeInfoTeamIdentifier` via `SecCodeCopySigningInformation`, and compares it against OpenAI's Apple team `2DC432GLL2`. A non-Codex caller (Claude Code) makes **every tool call** return `-10000 "Sender process is not authenticated"`.
+Beyond the self-check, `SkyComputerUseClient` has a **caller authentication** step: it resolves the caller's responsible process, reads `kSecCodeInfoTeamIdentifier` and `kSecCodeInfoIdentifier` via `SecCodeCopySigningInformation`, and compares them against OpenAI's Apple team `2DC432GLL2` plus an approved OpenAI bundle id. A non-Codex caller (Claude Code) makes **every tool call** return `-10000 "Sender process is not authenticated"`.
 
-The bypass is **not** a binary patch — it's a tiny DYLD interpose (`hook/team_hook.c` → `team_hook.dylib`) that hooks `SecCodeCopySigningInformation` and rewrites the team id in the returned dictionary to `2DC432GLL2`, so the gate always sees OpenAI's signature. Inject it with `DYLD_INSERT_LIBRARIES`; `install.sh` compiles it and wires it in at registration time.
+The bypass is **not** a binary patch — it's a tiny DYLD interpose (`hook/team_hook.c` → `team_hook.dylib`) that hooks `SecCodeCopySigningInformation` and rewrites the team id plus bundle identifier in the returned dictionary to an approved OpenAI caller, so the gate always sees OpenAI's signature. Inject it with `DYLD_INSERT_LIBRARIES`; `install.sh` compiles it and wires it in at registration time.
 
 > **Note:** the 3-NOP patch in step 3 only touches the **error-description getter** (`0x100019a00` is the NSError `description` getter); it does **not** gate this sender auth. The hook is what actually lets non-Codex agents in.
 
@@ -72,7 +87,7 @@ b.ne   …                    ; ← replaced with NOP
 
 ### Gate two: sender authentication (the real gate)
 
-See *Gate two* above. The client reads the caller's responsible-process `kSecCodeInfoTeamIdentifier` via `SecCodeCopySigningInformation` and compares it to OpenAI team `2DC432GLL2`; a mismatch makes every tool call return `-10000`. `team_hook.dylib` (a DYLD interpose) rewrites the team id to pass it — **no binary edit**.
+See *Gate two* above. The client reads the caller's responsible-process `kSecCodeInfoTeamIdentifier` and `kSecCodeInfoIdentifier` via `SecCodeCopySigningInformation` and compares them to OpenAI team `2DC432GLL2` plus the approved OpenAI bundle-id list; a mismatch makes every tool call return `-10000`. `team_hook.dylib` (a DYLD interpose) rewrites both fields to pass it — **no binary edit**.
 
 > System-level permissions (Accessibility + Screen Recording) are enforced by the macOS kernel and `tccd` — no userspace trick bypasses those. The system permission prompt on first launch after patching is expected; just click Allow.
 
@@ -100,19 +115,10 @@ The installer avoids POSIX-incompatible shell syntax, so `curl … | sh` (bash P
 | Target binary | `SkyComputerUseClient` (ARM64 Mach-O, `~/.codex/computer-use/…`) |
 | `0x100019a00` | NSError **description getter** (error-text mapping, **not** a permission gate; the old 3 NOPs land here) |
 | `0x1000197a8` | NSError `_code` getter (`senderNotAuthenticated → -10000`) |
-| Gate two | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` vs team `2DC432GLL2` |
+| Gate two | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` + `kSecCodeInfoIdentifier` vs OpenAI team and bundle-id allowlist |
 | Bypass | `hook/team_hook.c` → `team_hook.dylib`, injected via `DYLD_INSERT_LIBRARIES` (compiled by `install.sh`) |
 | NOP instruction | `1f 20 03 d5` (ARM64 NOP) |
 | Verified hash | `b7ad461bd5ead8c51b1e5a83e38915f6338872778d35dcb6123b74e9df9dcc47` (11841728-byte build) |
-
-## Appendix: opencua (experimental)
-
-`Sources/opencua/` holds a from-scratch macOS UI-automation MCP server (Swift, ~600 lines) that mirrors what `SkyComputerUseClient` does. Still experimental.
-
-```bash
-swift build -c release
-.build/release/opencua mcp
-```
 
 ## Scope & disclaimer
 

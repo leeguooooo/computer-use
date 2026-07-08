@@ -133,18 +133,20 @@ EOF
 # NOTE: "computer-use" is a RESERVED MCP server name in Claude Code and
 # will not load, so we register under "mac-computer-use".
 MCP_SERVER_NAME="mac-computer-use"
+CODEX_MCP_SERVER_NAME="mac_computer_use"
 HOOK_DIR="${HOME}/.codex/computer-use"
 HOOK_DYLIB="${HOOK_DIR}/team_hook.dylib"
 
 # The client has a SECOND gate beyond the (cosmetic) NOP patch: it
 # authenticates the caller by resolving the responsible process and calling
 # SecCodeCopySigningInformation, then checking kSecCodeInfoTeamIdentifier
-# against OpenAI's Apple team "2DC432GLL2". A non-Codex caller (Claude Code)
-# fails with -10000 "Sender process is not authenticated".
+# against OpenAI's Apple team "2DC432GLL2" and kSecCodeInfoIdentifier against
+# an approved OpenAI bundle id. A non-Codex caller (Claude Code) fails with
+# -10000 "Sender process is not authenticated".
 #
 # We bypass it WITHOUT patching by injecting a tiny DYLD interpose that
-# rewrites the team id the gate sees. Build it here so the install is
-# self-contained.
+# rewrites the team id and bundle identifier the gate sees. Build it here so
+# the install is self-contained.
 build_team_hook() {
   command -v clang >/dev/null 2>&1 || { warn "clang not found — skipping sender-auth hook (Xcode CLT needed)."; return 1; }
   mkdir -p "$HOOK_DIR"
@@ -154,15 +156,26 @@ build_team_hook() {
 #include <Security/Security.h>
 #include <stdio.h>
 #define APPROVED_TEAM CFSTR("2DC432GLL2")
+#define APPROVED_IDENTIFIER CFSTR("com.openai.codex")
 static OSStatus my_SecCodeCopySigningInformation(SecStaticCodeRef code, SecCSFlags flags, CFDictionaryRef *information) {
     OSStatus st = SecCodeCopySigningInformation(code, flags, information);
     if (st == errSecSuccess && information && *information) {
-        CFStringRef cur = (CFStringRef)CFDictionaryGetValue(*information, kSecCodeInfoTeamIdentifier);
-        if (cur == NULL || CFStringCompare(cur, APPROVED_TEAM, 0) != kCFCompareEqualTo) {
+        CFDictionaryRef original = *information;
+        CFStringRef team = (CFStringRef)CFDictionaryGetValue(original, kSecCodeInfoTeamIdentifier);
+        CFStringRef identifier = (CFStringRef)CFDictionaryGetValue(original, kSecCodeInfoIdentifier);
+        Boolean team_ok = team != NULL && CFStringCompare(team, APPROVED_TEAM, 0) == kCFCompareEqualTo;
+        Boolean identifier_ok = identifier != NULL && CFStringCompare(identifier, APPROVED_IDENTIFIER, 0) == kCFCompareEqualTo;
+        if (!team_ok || !identifier_ok) {
             fprintf(stderr, "[hook5] Injecting TeamIdentifier = 2DC432GLL2\n");
-            CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, *information);
-            CFDictionarySetValue(m, kSecCodeInfoTeamIdentifier, APPROVED_TEAM);
-            CFRelease(*information);
+            fprintf(stderr, "[hook5] Injecting Identifier = com.openai.codex\n");
+            CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, original);
+            if (!team_ok) {
+                CFDictionarySetValue(m, kSecCodeInfoTeamIdentifier, APPROVED_TEAM);
+            }
+            if (!identifier_ok) {
+                CFDictionarySetValue(m, kSecCodeInfoIdentifier, APPROVED_IDENTIFIER);
+            }
+            CFRelease(original);
             *information = m;
         }
     }
@@ -233,6 +246,58 @@ EOF
   detail "(Don't name it \"computer-use\" — that name is reserved in Claude Code.)"
   detail "The DYLD_INSERT_LIBRARIES hook is what lets a non-Codex caller pass the"
   detail "sender-authentication gate; without it every tool call returns -10000."
+}
+
+toml_dq() {
+  # Minimal TOML double-quoted string escape for local filesystem paths.
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+register_codex_mcp_server() {
+  local binary="$1"
+  local config="${HOME}/.codex/config.toml"
+
+  info ""
+  info "4b. Registering hooked MCP server with Codex…"
+
+  mkdir -p "$(dirname "$config")"
+  [[ -f "$config" ]] || : > "$config"
+
+  local backup
+  backup="${config}.backup-computer-use-$(date +%Y%m%d-%H%M%S)"
+  cp "$config" "$backup"
+
+  local tmp
+  tmp="$(mktemp -t codex_config)"
+  awk -v section="[mcp_servers.${CODEX_MCP_SERVER_NAME}]" \
+      -v env_section="[mcp_servers.${CODEX_MCP_SERVER_NAME}.env]" '
+    BEGIN { skip=0 }
+    /^\[.*\]$/ {
+      if ($0 == section || $0 == env_section) {
+        skip=1
+        next
+      }
+      skip=0
+    }
+    !skip { print }
+  ' "$config" > "$tmp"
+
+  {
+    printf '\n[mcp_servers.%s]\n' "$CODEX_MCP_SERVER_NAME"
+    printf 'command = "%s"\n' "$(toml_dq "$binary")"
+    printf 'args = ["mcp"]\n'
+    printf 'startup_timeout_sec = 120\n'
+    printf 'enabled = true\n'
+    printf '\n[mcp_servers.%s.env]\n' "$CODEX_MCP_SERVER_NAME"
+    printf 'DYLD_INSERT_LIBRARIES = "%s"\n' "$(toml_dq "$HOOK_DYLIB")"
+  } >> "$tmp"
+
+  mv "$tmp" "$config"
+  ok "Registered with Codex config as '${CODEX_MCP_SERVER_NAME}'"
+  detail "Config backup: ${backup}"
+  detail "Restart Codex for the hooked MCP tools to appear."
+  detail "If the bundled 'computer-use' plugin is also enabled, prefer the"
+  detail "'${CODEX_MCP_SERVER_NAME}' MCP tools when debugging sender-auth issues."
 }
 
 # ── re-sign for hook injection ─────────────────────────────────────────
@@ -401,6 +466,7 @@ EOF
 
   # 4. Register the MCP server with agent clients
   register_mcp_server "$BINARY"
+  register_codex_mcp_server "$BINARY"
 
   # 5. Trigger macOS permission dialogs
   trigger_permission_dialogs "$BINARY"
@@ -439,9 +505,10 @@ EOF
   info "  1. SkyComputerUseClient was patched (cosmetic self-check NOPs)"
   info "  2. Built team_hook.dylib (bypasses the sender-authentication gate)"
   info "  3. Registered as MCP server '${MCP_SERVER_NAME}' with the hook injected"
-  info "  4. Permissions were requested from macOS"
-  info "  5. System Settings opened as backup"
-  info "  6. Codex was restarted"
+  info "  4. Registered hooked MCP server '${CODEX_MCP_SERVER_NAME}' in Codex config"
+  info "  5. Permissions were requested from macOS"
+  info "  6. System Settings opened as backup"
+  info "  7. Codex was restarted"
   info ""
   info "${BOLD}Using it outside Codex (e.g. Claude Code):${RESET}"
   info "  Restart the agent, then the '${MCP_SERVER_NAME}' tools appear."

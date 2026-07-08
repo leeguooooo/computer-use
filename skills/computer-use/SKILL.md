@@ -11,7 +11,7 @@ Computer Use lets Codex interact with local Mac apps by reading the screen and p
 
 This skill drives a **patched** build of Codex's `SkyComputerUseClient`. The patch NOPs three permission self-check branches so the client stops refusing to work; system-level Accessibility + Screen Recording permissions are still enforced by macOS and prompted on first launch. See the repo README for the full principle.
 
-**Before your first Computer Use action, confirm the client is installed and patched.** If the Computer Use MCP server is missing, erroring, or refusing to act, run the installer — it locates `Codex Computer Use.app`, patches + re-signs the binary, **registers the patched binary as an MCP server**, triggers the macOS permission dialogs, and restarts Codex:
+**Before your first Computer Use action, confirm the client is installed and patched.** If the Computer Use MCP server is missing, erroring, or refusing to act, run the installer — it locates `Codex Computer Use.app`, patches + re-signs the binary, **registers the patched binary as a hooked MCP server**, triggers the macOS permission dialogs, and restarts Codex:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/install.sh | sh
@@ -19,14 +19,31 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/instal
 
 Then tell the user to click **Allow** on the macOS Accessibility and Screen Recording prompts (they may appear twice). If no dialog appears, it opens System Settings → Privacy & Security → Accessibility / Screen Recording, where `SkyComputerUseClient.app` should be listed to enable manually.
 
+### Codex app routing
+
+In Codex, the bundled `computer-use@openai-bundled` plugin can still expose tools under `mcp__computer_use`. If those tools fail with sender-auth / AppleEvent errors such as `-10000`, `-1743`, or `-1712`, run the installer and restart Codex, then prefer the hooked custom MCP server the installer writes to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.mac_computer_use]
+command = "/Users/you/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+args = ["mcp"]
+startup_timeout_sec = 120
+enabled = true
+
+[mcp_servers.mac_computer_use.env]
+DYLD_INSERT_LIBRARIES = "/Users/you/.codex/computer-use/team_hook.dylib"
+```
+
+After restart, tool discovery should expose the hooked `mac_computer_use` tools. Do not keep retrying the unhooked bundled `mcp__computer_use` path when it is the one returning sender-auth errors.
+
 ### Using it outside Codex (Claude Code and other agents)
 
 There are **two** gates, and running outside Codex requires clearing both:
 
 1. **Registration** — Codex wires up the MCP server from its plugin bundle; other agents need an explicit entry. The name MUST be `mac-computer-use` (or anything except `computer-use` — that name is reserved in Claude Code and silently refused).
-2. **Sender authentication** — the client authenticates its caller by resolving the responsible process and checking its code-signature team id (via `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier`) against OpenAI's Apple team `2DC432GLL2`. A non-Codex caller fails **every tool call** with error `-10000 "Sender process is not authenticated"`. (Note: the three-NOP binary patch does **not** touch this gate — it patches the cosmetic error-*description* getter.)
+2. **Sender authentication** — the client authenticates its caller by resolving the responsible process and checking its code-signature team id plus bundle identifier (via `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` + `kSecCodeInfoIdentifier`) against OpenAI's Apple team `2DC432GLL2` and the approved OpenAI bundle-id list. A non-Codex caller fails **every tool call** with error `-10000 "Sender process is not authenticated"`. (Note: the three-NOP binary patch does **not** touch this gate — it patches the cosmetic error-*description* getter.)
 
-The installer clears both: it builds a tiny DYLD interpose (`team_hook.dylib`) that rewrites the team id the gate sees, then registers the server with it injected. Equivalent to:
+The installer clears both: it builds a tiny DYLD interpose (`team_hook.dylib`) that rewrites the team id and bundle identifier the gate sees, then registers the server with it injected. For Claude Code, this is equivalent to:
 
 ```bash
 claude mcp add mac-computer-use --scope user \
