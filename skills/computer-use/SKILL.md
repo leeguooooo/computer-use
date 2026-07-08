@@ -11,13 +11,15 @@ Computer Use lets Codex interact with local Mac apps by reading the screen and p
 
 This skill drives a **patched** build of Codex's `SkyComputerUseClient`. The patch NOPs three permission self-check branches so the client stops refusing to work; system-level Accessibility + Screen Recording permissions are still enforced by macOS and prompted on first launch. See the repo README for the full principle.
 
-**Before your first Computer Use action, confirm the client is installed and patched.** If the Computer Use MCP server is missing, erroring, or refusing to act, run the installer — it locates `Codex Computer Use.app`, patches + re-signs the binary, **registers the patched binary as a hooked MCP server**, triggers the macOS permission dialogs, and restarts Codex:
+**Before your first Computer Use action, confirm the client is installed and patched.** If the Computer Use MCP server is missing, erroring, or refusing to act, run the installer — it refreshes the installed app from Codex's bundled source, patches + re-signs the binary while preserving service entitlements, **registers the patched binary as a hooked MCP server**, ensures Codex → Computer Use AppleEvents permission, triggers the macOS permission dialogs, and restarts Codex:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/install.sh | sh
 ```
 
 Then tell the user to click **Allow** on the macOS Accessibility and Screen Recording prompts (they may appear twice). If no dialog appears, it opens System Settings → Privacy & Security → Accessibility / Screen Recording, where `SkyComputerUseClient.app` should be listed to enable manually.
+
+If `list_apps` works but real app-state calls hang on macOS 26/27, treat that as the current deeper platform limitation rather than retrying the old unhooked bundled server. The installer should still preserve `SkyComputerUseService` entitlements and ensure the user TCC AppleEvents entry `com.openai.codex` → `com.openai.sky.CUAService`; missing either one commonly appears as `-1743` or a half-working server.
 
 ### Codex app routing
 

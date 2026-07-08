@@ -17,15 +17,16 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/instal
 
 脚本会自动：
 
-1. **定位** `Codex Computer Use.app`（依次检查 3 个已知位置）
+1. **刷新安装副本** —— 从 Codex bundled 的 `Codex Computer Use.app` 复制，避免 Codex 更新后继续复用旧的已 patch 副本
 2. **验证** 二进制版本，备份原始文件
 3. **打补丁** —— 把 3 条分支指令替换为 NOP（历史遗留，实为装饰性；详见「原理：两道门」）
-4. **重签名** —— ad-hoc 签名内外两层 app bundle
+4. **重签名** —— ad-hoc 签名内外两层 app bundle，并保留原始 service entitlements
 5. **编译 sender-auth hook** —— 构建 `team_hook.dylib`（见下「第二道门」）
 6. **注册 MCP** —— 把二进制注册成带 hook 的 MCP server，让 **Codex 和 Codex 以外的 agent（Claude Code 等）都走 hooked 路径**。脚本会在 `~/.codex/config.toml` 写入 `mac_computer_use`；检测到 `claude` CLI 时也会自动 `claude mcp add`（user scope，名字为 `mac-computer-use`，带 `DYLD_INSERT_LIBRARIES`）
-7. **弹权限窗** —— 直接启动 `SkyComputerUseClient`，macOS 会自动弹出 Accessibility 和 Screen Recording 权限请求
-8. **打开系统设置** —— 如果弹窗没出现，作为备选
-9. **重启 Codex**
+7. **确保 AppleEvents** —— 写入用户级 Codex → Computer Use AppleEvents 授权，避免 `-1743`
+8. **弹权限窗** —— 直接启动 `SkyComputerUseClient`，macOS 会自动弹出 Accessibility 和 Screen Recording 权限请求
+9. **打开系统设置** —— 如果弹窗没出现，作为备选
+10. **重启 Codex**
 
 > **⚠️ hooked MCP server 刻意不叫 `computer-use`。** `computer-use` 在 Claude Code 里是**保留名**，会被静默拒绝加载，所以 Claude Code 里使用 `mac-computer-use`。Codex 里写入 `~/.codex/config.toml` 的名字是 `mac_computer_use`。注册后**重启 agent** 才能加载这批桌面控制工具（`list_apps` / `get_app_state` / `click` / `type_text` / `press_key` …）。
 
@@ -117,6 +118,7 @@ sender 认证 hook 是**可移植**的 —— 每台机器上 `list_apps` 都能
 | `0x1000197a8` | NSError `_code` getter（`senderNotAuthenticated → -10000`） |
 | 第二道门 | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` + `kSecCodeInfoIdentifier` vs OpenAI team 和 bundle id 白名单 |
 | 绕过方式 | `hook/team_hook.c` → `team_hook.dylib`，`DYLD_INSERT_LIBRARIES` 注入（`install.sh` 自动编译） |
+| 必需 TCC 记录 | `com.openai.codex` → `com.openai.sky.CUAService` 的 AppleEvents 授权（`install.sh` 会写入用户 TCC 数据库） |
 | NOP 指令 | `1f 20 03 d5`（ARM64 NOP） |
 | 验证哈希 | `b7ad461bd5ead8c51b1e5a83e38915f6338872778d35dcb6123b74e9df9dcc47`（11841728 字节版） |
 

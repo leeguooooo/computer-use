@@ -33,9 +33,60 @@ detail(){ printf "  ${DIM}%s${RESET}\n" "$*"; }
 
 # ── locate Codex Computer Use ──────────────────────────────────────────
 
+INSTALL_DIR="${HOME}/.codex/computer-use"
+INSTALL_APP="${INSTALL_DIR}/Codex Computer Use.app"
+
+app_has_service_entitlements() {
+  local app="$1"
+  codesign -d --entitlements :- "$app" 2>/dev/null | grep -q "com.apple.application-identifier"
+}
+
+find_source_cua_app() {
+  for candidate in \
+    "$HOME/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use/Codex Computer Use.app" \
+    "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app" \
+    "$HOME/.codex/plugins/cache/openai-bundled/computer-use/"*/"Codex Computer Use.app"; do
+    if [[ -d "$candidate" ]] && app_has_service_entitlements "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+refresh_install_app() {
+  local source_app
+  source_app="$(find_source_cua_app || true)"
+  if [[ -z "$source_app" ]]; then
+    warn "Could not find an original bundled Computer Use app with service entitlements."
+    warn "Falling back to the existing installed copy if present."
+    return 0
+  fi
+
+  mkdir -p "$INSTALL_DIR"
+  if [[ -d "$INSTALL_APP" ]]; then
+    local current_hash source_hash
+    current_hash="$(shasum -a 256 "${INSTALL_APP}/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient" 2>/dev/null | awk '{print $1}' || true)"
+    source_hash="$(shasum -a 256 "${source_app}/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient" 2>/dev/null | awk '{print $1}' || true)"
+    if [[ "$current_hash" == "$source_hash" ]] && app_has_service_entitlements "$INSTALL_APP"; then
+      detail "Installed copy already matches bundled source."
+      return 0
+    fi
+
+    local backup
+    backup="${INSTALL_APP}.backup-before-refresh-$(date +%Y%m%d-%H%M%S)"
+    mv "$INSTALL_APP" "$backup"
+    detail "Previous installed copy backed up: ${backup}"
+  fi
+
+  ditto "$source_app" "$INSTALL_APP"
+  ok "Refreshed installed app from bundled source"
+  detail "Source: ${source_app}"
+}
+
 find_cua_app() {
   for candidate in \
-    "$HOME/.codex/computer-use/Codex Computer Use.app" \
+    "$INSTALL_APP" \
     "$HOME/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use/Codex Computer Use.app" \
     "$HOME/.codex/plugins/cache/openai-bundled/computer-use/"*/"Codex Computer Use.app" \
     "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"; do
@@ -63,6 +114,48 @@ read_hex() {
 }
 
 # ── macOS permission dialogs ───────────────────────────────────────────
+
+ensure_codex_appleevents_permission() {
+  local tccdb_db="${HOME}/Library/Application Support/com.apple.TCC/TCC.db"
+  if [[ ! -f "$tccdb_db" ]] || ! command -v sqlite3 >/dev/null 2>&1; then
+    warn "Could not update AppleEvents permission automatically."
+    detail "If tool calls fail with -1743, allow Codex to control Codex Computer Use in System Settings."
+    return 0
+  fi
+
+  local granted
+  granted=$(sqlite3 "$tccdb_db" "SELECT count(*) FROM access WHERE service='kTCCServiceAppleEvents' AND client='com.openai.codex' AND indirect_object_identifier='com.openai.sky.CUAService' AND auth_value>=2" 2>/dev/null || true)
+  if [[ "${granted:-0}" -gt 0 ]]; then
+    ok "AppleEvents permission already allows Codex to control Computer Use"
+    return 0
+  fi
+
+  local backup
+  backup="${tccdb_db}.backup-computer-use-$(date +%Y%m%d-%H%M%S)"
+  cp "$tccdb_db" "$backup"
+
+  sqlite3 "$tccdb_db" <<'SQL' || {
+INSERT OR REPLACE INTO access (
+  service, client, client_type, auth_value, auth_reason, auth_version,
+  csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier,
+  indirect_object_code_identity, flags, last_modified, pid, pid_version,
+  boot_uuid, last_reminded
+) VALUES (
+  'kTCCServiceAppleEvents', 'com.openai.codex', 0, 2, 4, 1,
+  NULL, NULL, 0, 'com.openai.sky.CUAService',
+  NULL, NULL, CAST(strftime('%s','now') AS INTEGER), NULL, NULL,
+  'UNUSED', CAST(strftime('%s','now') AS INTEGER)
+);
+SQL
+    warn "Failed to write AppleEvents permission."
+    detail "TCC backup: ${backup}"
+    return 0
+  }
+
+  killall tccd >/dev/null 2>&1 || true
+  ok "Granted AppleEvents permission for Codex → Computer Use"
+  detail "TCC backup: ${backup}"
+}
 
 # Launch SkyComputerUseClient briefly so macOS TCC shows the permission
 # dialogs for Accessibility and Screen Recording. The user just clicks
@@ -320,14 +413,12 @@ register_codex_mcp_server() {
 resign_binary() {
   info ""
   info "Re-signing…"
-  # DEFAULT: one CONSISTENT ad-hoc --deep over the whole bundle, preserving the
-  # original entitlements (app-groups/keychain/team-id). This is the config
-  # verified to give FULL function (list_apps AND get_app_state) on permissive
-  # macOS. Stripping entitlements or re-signing binaries piecemeal breaks the
-  # client↔Service handshake → get_app_state returns -10005. On permissive
-  # macOS the ad-hoc team_hook.dylib injects fine without extra entitlements.
+  # Preserve original app-group/keychain/team-id entitlements on both the
+  # client and service app bundles. A final `codesign --deep` looks convenient
+  # but strips the outer service entitlements after ad-hoc signing, which lets
+  # list_apps work while get_app_state hangs in the deeper service path.
   codesign -s - --force --preserve-metadata=entitlements "${INNER_APP}" 2>/dev/null && ok "Inner app signed"
-  codesign -s - --force --deep "${CUA_APP}" 2>/dev/null && ok "Outer app signed (consistent seal)"
+  codesign -s - --force --preserve-metadata=entitlements "${CUA_APP}" 2>/dev/null && ok "Outer app signed"
 
   # OPT-IN for machines that enforce library validation (the ad-hoc hook gets
   # SIGKILL'd "Code Signature Invalid", e.g. some macOS 15.x): add the two
@@ -372,6 +463,7 @@ main() {
 
   # 1. Find the app
   info "1. Locating Codex Computer Use…"
+  refresh_install_app
   CUA_APP="$(find_cua_app)" || true
   if [[ -z "$CUA_APP" ]]; then
     cat >&2 <<EOF
@@ -470,6 +562,7 @@ EOF
 
   # 5. Trigger macOS permission dialogs
   trigger_permission_dialogs "$BINARY"
+  ensure_codex_appleevents_permission
 
   # 6. Open System Settings as backup
   info ""
@@ -507,8 +600,9 @@ EOF
   info "  3. Registered as MCP server '${MCP_SERVER_NAME}' with the hook injected"
   info "  4. Registered hooked MCP server '${CODEX_MCP_SERVER_NAME}' in Codex config"
   info "  5. Permissions were requested from macOS"
-  info "  6. System Settings opened as backup"
-  info "  7. Codex was restarted"
+  info "  6. Codex → Computer Use AppleEvents permission was ensured"
+  info "  7. System Settings opened as backup"
+  info "  8. Codex was restarted"
   info ""
   info "${BOLD}Using it outside Codex (e.g. Claude Code):${RESET}"
   info "  Restart the agent, then the '${MCP_SERVER_NAME}' tools appear."

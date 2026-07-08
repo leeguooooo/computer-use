@@ -17,15 +17,16 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/instal
 
 The script automatically:
 
-1. **Locates** `Codex Computer Use.app` (checks 3 known paths).
+1. **Refreshes** the installed copy from Codex's bundled `Codex Computer Use.app` so stale patched copies do not survive across Codex updates.
 2. **Verifies** the binary version and backs up the original.
 3. **Patches** — replaces 3 branch instructions with NOPs (legacy step, actually cosmetic; see *How it works: two gates*).
-4. **Re-signs** — ad-hoc signs both the inner and outer app bundles.
+4. **Re-signs** — ad-hoc signs both the inner and outer app bundles while preserving the original service entitlements.
 5. **Builds the sender-auth hook** — compiles `team_hook.dylib` (see *Gate two* below).
 6. **Registers the MCP server** — with the hook injected, so **Codex and non-Codex agents (Claude Code, etc.) can use the hooked path**. It writes `~/.codex/config.toml` as `mac_computer_use`; if the `claude` CLI is present it also runs `claude mcp add` at user scope as `mac-computer-use` with `DYLD_INSERT_LIBRARIES`.
-7. **Triggers the permission dialogs** — launches `SkyComputerUseClient` so macOS prompts for Accessibility + Screen Recording.
-8. **Opens System Settings** — as a fallback if no dialog appears.
-9. **Restarts Codex.**
+7. **Ensures AppleEvents** — grants the user-level Codex → Computer Use AppleEvents permission needed to avoid `-1743`.
+8. **Triggers the permission dialogs** — launches `SkyComputerUseClient` so macOS prompts for Accessibility + Screen Recording.
+9. **Opens System Settings** — as a fallback if no dialog appears.
+10. **Restarts Codex.**
 
 > **⚠️ The hooked MCP server is intentionally not named `computer-use`.** Claude Code reserves that name and silently refuses it, so the installer uses `mac-computer-use` there. Codex receives `mac_computer_use` in `~/.codex/config.toml`. **Restart the agent** after registering so it loads the desktop-control tools (`list_apps` / `get_app_state` / `click` / `type_text` / `press_key` …).
 
@@ -117,6 +118,7 @@ The installer avoids POSIX-incompatible shell syntax, so `curl … | sh` (bash P
 | `0x1000197a8` | NSError `_code` getter (`senderNotAuthenticated → -10000`) |
 | Gate two | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` + `kSecCodeInfoIdentifier` vs OpenAI team and bundle-id allowlist |
 | Bypass | `hook/team_hook.c` → `team_hook.dylib`, injected via `DYLD_INSERT_LIBRARIES` (compiled by `install.sh`) |
+| Required TCC entry | `com.openai.codex` → `com.openai.sky.CUAService` for AppleEvents (`install.sh` ensures this in the user TCC database) |
 | NOP instruction | `1f 20 03 d5` (ARM64 NOP) |
 | Verified hash | `b7ad461bd5ead8c51b1e5a83e38915f6338872778d35dcb6123b74e9df9dcc47` (11841728-byte build) |
 
