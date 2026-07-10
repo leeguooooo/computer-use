@@ -45,7 +45,7 @@ There are **two** gates, and running outside Codex requires clearing both:
 1. **Registration** — Codex wires up the MCP server from its plugin bundle; other agents need an explicit entry. The name MUST be `mac-computer-use` (or anything except `computer-use` — that name is reserved in Claude Code and silently refused).
 2. **Sender authentication** — the client authenticates its caller by resolving the responsible process and checking its code-signature team id plus bundle identifier (via `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` + `kSecCodeInfoIdentifier`) against OpenAI's Apple team `2DC432GLL2` and the approved OpenAI bundle-id list. A non-Codex caller fails **every tool call** with error `-10000 "Sender process is not authenticated"`. (Note: the three-NOP binary patch does **not** touch this gate — it patches the cosmetic error-*description* getter.)
 
-The installer clears both: it builds a tiny DYLD interpose (`team_hook.dylib`) that rewrites the team id and bundle identifier the gate sees, then registers the server with it injected. For Claude Code, this is equivalent to:
+The installer clears both: it builds a tiny DYLD interpose (`team_hook.dylib`) that rewrites the team id and bundle identifier the gate sees, then registers the server with it injected. The hook is built as arm64 + arm64e and stays inert outside `SkyComputerUseClient`; do not export `DYLD_INSERT_LIBRARIES` globally. For Claude Code, this is equivalent to:
 
 ```bash
 claude mcp add mac-computer-use --scope user \
@@ -54,6 +54,20 @@ claude mcp add mac-computer-use --scope user \
 ```
 
 After registration, **restart the agent** so it picks up the new stdio server; the desktop-control tools (`list_apps`, `get_app_state`, `click`, `type_text`, `press_key`, `scroll`, `drag`, …) then become available. For other MCP clients (Cursor, Cline, Windsurf), add the same `command`/`args`/`env` stdio entry to their own config — the `DYLD_INSERT_LIBRARIES` env is what makes tool calls pass the sender gate.
+
+When testing through non-interactive `claude -p`, remember that per-app Computer Use approval is an MCP `Elicitation` dialog. If `get_app_state` fails with `Computer Use permission request canceled for app 'com.apple.calculator'`, add a project-local `.claude/settings.local.json` `Elicitation` hook that accepts only the exact app prompt being tested, for example `mcp_server_name == "mac-computer-use"` and `message == "Allow Codex to use Calculator?"`, returning:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "Elicitation",
+    "action": "accept",
+    "content": {}
+  }
+}
+```
+
+Do not auto-accept all Computer Use app prompts globally; keep this narrowly scoped for the smoke test.
 
 `install.sh` is idempotent: if the binary is already patched it detects the state and skips re-patching, so it is safe to re-run whenever Computer Use stops responding.
 

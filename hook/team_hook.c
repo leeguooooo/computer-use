@@ -9,23 +9,52 @@
 // Claude Code), those fields don't match and every tool call fails with
 // error -10000 "Sender process is not authenticated".
 //
-// We interpose SecCodeCopySigningInformation: call the real one, then
-// rewrite kSecCodeInfoTeamIdentifier and kSecCodeInfoIdentifier in the
-// returned dictionary so the gate sees an approved OpenAI caller.
+// We interpose SecCodeCopySigningInformation inside SkyComputerUseClient:
+// call the real one, then rewrite kSecCodeInfoTeamIdentifier and
+// kSecCodeInfoIdentifier in the returned dictionary so the gate sees an
+// approved OpenAI caller. If DYLD_INSERT_LIBRARIES accidentally leaks into an
+// unrelated process, this hook stays inert.
 //
 // Inject with: DYLD_INSERT_LIBRARIES=/path/to/team_hook.dylib
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
+#include <mach-o/dyld.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syslimits.h>
 
 #define APPROVED_TEAM CFSTR("2DC432GLL2")
 #define APPROVED_IDENTIFIER CFSTR("com.openai.codex")
+
+static int should_rewrite_current_process(void) {
+    static int cached = -1;
+    if (cached != -1) {
+        return cached;
+    }
+
+    const char *process_name = getprogname();
+    if (process_name && strcmp(process_name, "SkyComputerUseClient") == 0) {
+        cached = 1;
+        return cached;
+    }
+
+    char path[PATH_MAX];
+    uint32_t size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size) == 0 && strstr(path, "SkyComputerUseClient") != NULL) {
+        cached = 1;
+        return cached;
+    }
+
+    cached = 0;
+    return cached;
+}
 
 static OSStatus my_SecCodeCopySigningInformation(SecStaticCodeRef code,
                                                  SecCSFlags flags,
                                                  CFDictionaryRef *information) {
     OSStatus st = SecCodeCopySigningInformation(code, flags, information);
-    if (st == errSecSuccess && information && *information) {
+    if (should_rewrite_current_process() && st == errSecSuccess && information && *information) {
         CFDictionaryRef original = *information;
         CFStringRef team = (CFStringRef)CFDictionaryGetValue(original,
                                                              kSecCodeInfoTeamIdentifier);
@@ -60,4 +89,8 @@ __attribute__((section("__DATA,__interpose"))) = {
 };
 
 __attribute__((constructor))
-static void team_hook_loaded(void) { fprintf(stderr, "[hook5] loaded\n"); }
+static void team_hook_loaded(void) {
+    if (should_rewrite_current_process()) {
+        fprintf(stderr, "[hook5] loaded\n");
+    }
+}

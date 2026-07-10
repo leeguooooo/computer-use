@@ -25,6 +25,17 @@ YELLOW=$(printf '\033[33m')
 RED=$(printf '\033[31m')
 RESET=$(printf '\033[0m')
 
+# The hook is only safe for SkyComputerUseClient. If the installer is run from
+# an environment that already has DYLD injection enabled, ordinary child
+# processes such as osascript, open, claude, or System Settings can inherit it
+# and crash. Keep the installer process clean; pass DYLD_INSERT_LIBRARIES only
+# through the MCP server config/env written below.
+unset DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
+
+without_dyld_env() {
+  env -u DYLD_INSERT_LIBRARIES -u DYLD_LIBRARY_PATH -u DYLD_FRAMEWORK_PATH "$@"
+}
+
 info()  { printf "${BOLD}%s${RESET}\n" "$*"; }
 ok()    { printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
 warn()  { printf "  ${YELLOW}⚠${RESET} %s\n" "$*"; }
@@ -167,7 +178,7 @@ trigger_permission_dialogs() {
   local tccdb_db="${HOME}/Library/Application Support/com.apple.TCC/TCC.db"
   if [[ -f "$tccdb_db" ]]; then
     local bundle_id
-    bundle_id=$(osascript -e "id of app \"SkyComputerUseClient\"" 2>/dev/null || true)
+    bundle_id=$(without_dyld_env osascript -e "id of app \"SkyComputerUseClient\"" 2>/dev/null || true)
     if [[ -z "$bundle_id" ]]; then
       # Fallback: try to read from the app's Info.plist
       bundle_id=$(plutil -p "${INNER_APP}/Contents/Info.plist" 2>/dev/null | grep CFBundleIdentifier | awk -F'"' '{print $4}' || true)
@@ -196,7 +207,7 @@ trigger_permission_dialogs() {
   detail ""
 
   # Run in a new Terminal window so the user sees what's happening
-  osascript <<EOF
+  without_dyld_env osascript <<EOF
 tell application "Terminal"
   activate
   do script "${binary} mcp; exit"
@@ -247,12 +258,35 @@ build_team_hook() {
   cat > "$src" <<'HOOKC'
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
+#include <mach-o/dyld.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syslimits.h>
 #define APPROVED_TEAM CFSTR("2DC432GLL2")
 #define APPROVED_IDENTIFIER CFSTR("com.openai.codex")
+static int should_rewrite_current_process(void) {
+    static int cached = -1;
+    if (cached != -1) {
+        return cached;
+    }
+    const char *process_name = getprogname();
+    if (process_name && strcmp(process_name, "SkyComputerUseClient") == 0) {
+        cached = 1;
+        return cached;
+    }
+    char path[PATH_MAX];
+    uint32_t size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size) == 0 && strstr(path, "SkyComputerUseClient") != NULL) {
+        cached = 1;
+        return cached;
+    }
+    cached = 0;
+    return cached;
+}
 static OSStatus my_SecCodeCopySigningInformation(SecStaticCodeRef code, SecCSFlags flags, CFDictionaryRef *information) {
     OSStatus st = SecCodeCopySigningInformation(code, flags, information);
-    if (st == errSecSuccess && information && *information) {
+    if (should_rewrite_current_process() && st == errSecSuccess && information && *information) {
         CFDictionaryRef original = *information;
         CFStringRef team = (CFStringRef)CFDictionaryGetValue(original, kSecCodeInfoTeamIdentifier);
         CFStringRef identifier = (CFStringRef)CFDictionaryGetValue(original, kSecCodeInfoIdentifier);
@@ -279,9 +313,14 @@ _interpose_SecCodeCopySigningInformation __attribute__((section("__DATA,__interp
     (const void *)(uintptr_t)&my_SecCodeCopySigningInformation,
     (const void *)(uintptr_t)&SecCodeCopySigningInformation
 };
-__attribute__((constructor)) static void team_hook_loaded(void) { fprintf(stderr, "[hook5] loaded\n"); }
+__attribute__((constructor)) static void team_hook_loaded(void) {
+    if (should_rewrite_current_process()) {
+        fprintf(stderr, "[hook5] loaded\n");
+    }
+}
 HOOKC
-  if clang -arch arm64 -dynamiclib -framework CoreFoundation -framework Security -o "$HOOK_DYLIB" "$src" 2>/dev/null; then
+  if clang -arch arm64 -arch arm64e -dynamiclib -framework CoreFoundation -framework Security -o "$HOOK_DYLIB" "$src" 2>/dev/null \
+    || clang -arch arm64 -dynamiclib -framework CoreFoundation -framework Security -o "$HOOK_DYLIB" "$src" 2>/dev/null; then
     codesign -s - -f "$HOOK_DYLIB" >/dev/null 2>&1
     rm -f "$src"
     ok "Built sender-auth hook: ${HOOK_DYLIB}"
@@ -311,8 +350,8 @@ register_mcp_server() {
   if command -v claude >/dev/null 2>&1; then
     # Idempotent: drop any prior entry, then add fresh at user scope so
     # the tools are available across all projects.
-    claude mcp remove "$MCP_SERVER_NAME" --scope user >/dev/null 2>&1 || true
-    if claude mcp add "$MCP_SERVER_NAME" --scope user "${dyld_env[@]}" -- "$binary" mcp >/dev/null 2>&1; then
+    without_dyld_env claude mcp remove "$MCP_SERVER_NAME" --scope user >/dev/null 2>&1 || true
+    if without_dyld_env claude mcp add "$MCP_SERVER_NAME" --scope user "${dyld_env[@]}" -- "$binary" mcp >/dev/null 2>&1; then
       ok "Registered with Claude Code (user scope) as '${MCP_SERVER_NAME}'"
       detail "Restart Claude Code for the new tools to appear."
       registered=true
@@ -574,7 +613,7 @@ EOF
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" \
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" \
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity?Privacy_ScreenCapture"; do
-    open "$url" 2>/dev/null && break
+    without_dyld_env open "$url" 2>/dev/null && break
   done 2>/dev/null || true
 
   # 7. Restart Codex

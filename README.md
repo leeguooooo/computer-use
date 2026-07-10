@@ -49,7 +49,7 @@ DYLD_INSERT_LIBRARIES = "/Users/you/.codex/computer-use/team_hook.dylib"
 
 Beyond the self-check, `SkyComputerUseClient` has a **caller authentication** step: it resolves the caller's responsible process, reads `kSecCodeInfoTeamIdentifier` and `kSecCodeInfoIdentifier` via `SecCodeCopySigningInformation`, and compares them against OpenAI's Apple team `2DC432GLL2` plus an approved OpenAI bundle id. A non-Codex caller (Claude Code) makes **every tool call** return `-10000 "Sender process is not authenticated"`.
 
-The bypass is **not** a binary patch — it's a tiny DYLD interpose (`hook/team_hook.c` → `team_hook.dylib`) that hooks `SecCodeCopySigningInformation` and rewrites the team id plus bundle identifier in the returned dictionary to an approved OpenAI caller, so the gate always sees OpenAI's signature. Inject it with `DYLD_INSERT_LIBRARIES`; `install.sh` compiles it and wires it in at registration time.
+The bypass is **not** a binary patch — it's a tiny DYLD interpose (`hook/team_hook.c` → `team_hook.dylib`) that hooks `SecCodeCopySigningInformation` and rewrites the team id plus bundle identifier in the returned dictionary to an approved OpenAI caller, so the gate always sees OpenAI's signature. Inject it with `DYLD_INSERT_LIBRARIES`; `install.sh` compiles it and wires it in at registration time. The hook is built as arm64 + arm64e and is process-guarded so it stays inert outside `SkyComputerUseClient`; the installer also clears inherited DYLD variables before launching helper tools such as `open`, `osascript`, and `claude`.
 
 > **Note:** the 3-NOP patch in step 3 only touches the **error-description getter** (`0x100019a00` is the NSError `description` getter); it does **not** gate this sender auth. The hook is what actually lets non-Codex agents in.
 
@@ -58,6 +58,48 @@ The bypass is **not** a binary patch — it's a tiny DYLD interpose (`hook/team_
 **Click Allow on the macOS dialogs** (it may prompt twice — Accessibility and Screen Recording), then wait for Codex to relaunch.
 
 If no dialog appears, open System Settings → Privacy & Security → Accessibility / Screen Recording and enable `SkyComputerUseClient.app` in the list.
+
+### Headless `claude -p` runs
+
+Claude Code's interactive UI can show Computer Use's per-app elicitation dialog. Headless `claude -p` cannot click that dialog, so scripted smoke tests may fail with:
+
+```text
+Computer Use permission request canceled for app 'com.apple.calculator'.
+```
+
+For non-interactive tests, add a project-local `Elicitation` hook that accepts only the specific app prompt you intend to test. Example for Calculator:
+
+```json
+{
+  "hooks": {
+    "Elicitation": [
+      {
+        "matcher": "mac-computer-use",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/auto-accept-calculator-elicitation.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook should inspect stdin and return this only for `mcp_server_name == "mac-computer-use"` and `message == "Allow Codex to use Calculator?"`:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "Elicitation",
+    "action": "accept",
+    "content": {}
+  }
+}
+```
+
+Keep this in `.claude/settings.local.json` for local testing unless you intentionally want to share the policy. Do not globally auto-accept all Computer Use app prompts.
 
 ### Restore
 
@@ -117,7 +159,7 @@ The installer avoids POSIX-incompatible shell syntax, so `curl … | sh` (bash P
 | `0x100019a00` | NSError **description getter** (error-text mapping, **not** a permission gate; the old 3 NOPs land here) |
 | `0x1000197a8` | NSError `_code` getter (`senderNotAuthenticated → -10000`) |
 | Gate two | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` + `kSecCodeInfoIdentifier` vs OpenAI team and bundle-id allowlist |
-| Bypass | `hook/team_hook.c` → `team_hook.dylib`, injected via `DYLD_INSERT_LIBRARIES` (compiled by `install.sh`) |
+| Bypass | `hook/team_hook.c` → guarded universal `team_hook.dylib`, injected into `SkyComputerUseClient` via `DYLD_INSERT_LIBRARIES` (compiled by `install.sh`) |
 | Required TCC entry | `com.openai.codex` → `com.openai.sky.CUAService` for AppleEvents (`install.sh` ensures this in the user TCC database) |
 | NOP instruction | `1f 20 03 d5` (ARM64 NOP) |
 | Verified hash | `b7ad461bd5ead8c51b1e5a83e38915f6338872778d35dcb6123b74e9df9dcc47` (11841728-byte build) |
