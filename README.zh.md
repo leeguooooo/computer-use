@@ -49,7 +49,7 @@ DYLD_INSERT_LIBRARIES = "/Users/you/.codex/computer-use/team_hook.dylib"
 
 除了权限自检，`SkyComputerUseClient` 还有一道**调用方身份认证**：它解析调用方的 responsible 进程，用 `SecCodeCopySigningInformation` 取 `kSecCodeInfoTeamIdentifier` 和 `kSecCodeInfoIdentifier`，跟 OpenAI 的 Apple team `2DC432GLL2` 以及 OpenAI bundle id 白名单比对。非 Codex 调用方（Claude Code）会让**每个 tool 调用**都返回 `-10000 "Sender process is not authenticated"`。
 
-绕过方式**不是**打二进制补丁，而是注入一个极小的 DYLD interpose（`hook/team_hook.c` → `team_hook.dylib`）：它 hook `SecCodeCopySigningInformation`，把返回字典里的 team id 和 bundle identifier 改写成允许的 OpenAI 调用方，让这道门始终看到 OpenAI 的签名。用 `DYLD_INSERT_LIBRARIES` 注入即可，`install.sh` 会自动编译并在注册 MCP 时带上。
+绕过方式**不是**打二进制补丁，而是注入一个极小的 DYLD interpose（`hook/team_hook.c` → `team_hook.dylib`）：它 hook `SecCodeCopySigningInformation`，把返回字典里的 team id 和 bundle identifier 改写成允许的 OpenAI 调用方，让这道门始终看到 OpenAI 的签名。用 `DYLD_INSERT_LIBRARIES` 注入即可，`install.sh` 会自动编译并在注册 MCP 时带上。hook 会编成 arm64 + arm64e，并且只在 `SkyComputerUseClient` 进程内生效；安装器启动 `open`、`osascript`、`claude` 等辅助命令前也会清掉继承来的 DYLD 变量，避免误注入 System Settings 这类普通进程。
 
 > **注**：上面第 3 步那个「三处分支改 NOP」的补丁其实**只动了错误信息的描述函数**（`0x100019a00` 是 NSError 的 description getter），并不 gate 这道 sender 认证——真正让非 Codex 能用的是这个 hook。
 
@@ -58,6 +58,48 @@ DYLD_INSERT_LIBRARIES = "/Users/you/.codex/computer-use/team_hook.dylib"
 **在 macOS 弹窗上点「允许」/「Allow」**（可能会弹两次，分别针对辅助功能和屏幕录制），然后等 Codex 重启完成即可使用。
 
 如果弹窗没有自动出现，打开系统设置 → 隐私与安全性 → 辅助功能 / 屏幕录制，应该能看到 `SkyComputerUseClient.app` 在列表中，勾上即可。
+
+### Headless `claude -p` 运行
+
+Claude Code 的交互界面可以展示 Computer Use 的单 app elicitation 授权弹窗。headless `claude -p` 没法点击这个弹窗，所以脚本化 smoke test 可能失败为：
+
+```text
+Computer Use permission request canceled for app 'com.apple.calculator'.
+```
+
+非交互测试时，给项目加一个本地 `Elicitation` hook，只接受你明确要测试的那个 app 提示。Calculator 示例：
+
+```json
+{
+  "hooks": {
+    "Elicitation": [
+      {
+        "matcher": "mac-computer-use",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/auto-accept-calculator-elicitation.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+hook 应该检查 stdin，并且只在 `mcp_server_name == "mac-computer-use"` 且 `message == "Allow Codex to use Calculator?"` 时返回：
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "Elicitation",
+    "action": "accept",
+    "content": {}
+  }
+}
+```
+
+除非你明确想共享这条策略，否则把它放在 `.claude/settings.local.json` 做本机测试。不要全局自动接受所有 Computer Use app 授权提示。
 
 ### 恢复
 
@@ -117,7 +159,7 @@ sender 认证 hook 是**可移植**的 —— 每台机器上 `list_apps` 都能
 | `0x100019a00` | NSError **description getter**（错误文案映射，**非**权限门；老补丁的 3 个 NOP 落在这里） |
 | `0x1000197a8` | NSError `_code` getter（`senderNotAuthenticated → -10000`） |
 | 第二道门 | `SecCodeCopySigningInformation` → `kSecCodeInfoTeamIdentifier` + `kSecCodeInfoIdentifier` vs OpenAI team 和 bundle id 白名单 |
-| 绕过方式 | `hook/team_hook.c` → `team_hook.dylib`，`DYLD_INSERT_LIBRARIES` 注入（`install.sh` 自动编译） |
+| 绕过方式 | `hook/team_hook.c` → 带进程守卫的 universal `team_hook.dylib`，通过 `DYLD_INSERT_LIBRARIES` 注入 `SkyComputerUseClient`（`install.sh` 自动编译） |
 | 必需 TCC 记录 | `com.openai.codex` → `com.openai.sky.CUAService` 的 AppleEvents 授权（`install.sh` 会写入用户 TCC 数据库） |
 | NOP 指令 | `1f 20 03 d5`（ARM64 NOP） |
 | 验证哈希 | `b7ad461bd5ead8c51b1e5a83e38915f6338872778d35dcb6123b74e9df9dcc47`（11841728 字节版） |
