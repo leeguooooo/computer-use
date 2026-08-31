@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional
 
 
+__version__ = "2.0.0"  # keep in sync with plugin.json
 SERVER_NAME = "codex-computer-use"
 
 # Markers that identify an installed OpenAI Computer Use plugin root. OpenAI has
@@ -588,6 +589,11 @@ def run_proxy(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Broker official Codex Computer Use to MCP clients"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"codex-computer-use-mcp {__version__}",
     )
     subparsers = parser.add_subparsers(dest="subcommand")
     configure = subparsers.add_parser("configure")

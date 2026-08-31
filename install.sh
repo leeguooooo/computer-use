@@ -2,7 +2,9 @@
 set -eu
 
 REPOSITORY="${COMPUTER_USE_REPOSITORY:-leeguooooo/computer-use}"
-RAW_BASE="${COMPUTER_USE_RAW_BASE:-https://raw.githubusercontent.com/${REPOSITORY}/main}"
+# Default to the latest on main; pin a release with COMPUTER_USE_REF=v2.0.0
+REF="${COMPUTER_USE_REF:-main}"
+RAW_BASE="${COMPUTER_USE_RAW_BASE:-https://raw.githubusercontent.com/${REPOSITORY}/${REF}}"
 INSTALL_DIR="${COMPUTER_USE_INSTALL_DIR:-${HOME}/.local/share/codex-computer-use}"
 BIN_DIR="${COMPUTER_USE_BIN_DIR:-${HOME}/.local/bin}"
 TARGET="${BIN_DIR}/codex-computer-use-mcp"
@@ -66,7 +68,7 @@ trap - EXIT HUP INT TERM
 "$TARGET" configure --command "$TARGET"
 
 info ""
-info "Installed: ${TARGET}"
+info "Installed: ${TARGET} ($("$TARGET" --version 2>/dev/null || echo version unknown))"
 info "MCP server: codex-computer-use"
 info "Restart Claude Code and Cursor so they reload MCP configuration."
 case ":${PATH}:" in

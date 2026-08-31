@@ -60,7 +60,29 @@ This installs a single Python file to `~/.local/bin/codex-computer-use-mcp` and
 idempotently registers it (as `codex-computer-use`) in your Claude Code and
 Cursor MCP configs. Restart Claude Code / Cursor afterward.
 
-Uninstall:
+## Update
+
+Re-run the same one-liner — the installer is idempotent, overwrites the broker
+in place, and re-registers it without touching your other MCP servers:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/install.sh | sh
+```
+
+Restart Claude Code / Cursor afterward. Check what you have with:
+
+```sh
+~/.local/bin/codex-computer-use-mcp --version
+```
+
+By default the installer tracks the latest `main`. To pin a specific release,
+set `COMPUTER_USE_REF`:
+
+```sh
+COMPUTER_USE_REF=v2.0.0 curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/v2.0.0/install.sh | sh
+```
+
+## Uninstall
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/computer-use/main/install.sh | sh -s -- --uninstall
