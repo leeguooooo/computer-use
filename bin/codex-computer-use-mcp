@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional
 
 
@@ -324,6 +325,123 @@ def _encode_message(message: Any) -> str:
     return json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
+# A Computer Use session started through this broker spawns an OpenAI
+# `SkyComputerUseClient` under the Codex child process. Those clients put
+# themselves in their own process group and are reparented to launchd when their
+# Codex worker exits, so they survive the session and accumulate over many runs
+# until the native pipe fails to start. We reap only the ones we positively
+# linked to *our* Codex child while their ancestry was still intact, so a
+# concurrent, unrelated Codex Computer Use session is never touched.
+SKY_CLIENT_MARKER = "SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+
+
+def _process_snapshot() -> dict:
+    """Map pid -> (ppid, command line) for every process (macOS `ps`)."""
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,command="], text=True
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    snapshot: dict = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_s, ppid_s, command = parts
+        try:
+            snapshot[int(pid_s)] = (int(ppid_s), command)
+        except ValueError:
+            continue
+    return snapshot
+
+
+def _is_descendant_of(pid: int, ancestor: int, snapshot: Mapping[int, Any]) -> bool:
+    seen: set = set()
+    current = pid
+    while current and current not in seen:
+        seen.add(current)
+        entry = snapshot.get(current)
+        if entry is None:
+            return False
+        parent = entry[0]
+        if parent == ancestor:
+            return True
+        if parent in (0, 1) or parent == current:
+            return False
+        current = parent
+    return False
+
+
+def _sky_clients_under(ancestor: int, snapshot: Mapping[int, Any]) -> set:
+    """Sky Computer Use client pids that descend from `ancestor`."""
+    result: set = set()
+    for pid, (_ppid, command) in snapshot.items():
+        if SKY_CLIENT_MARKER in command and _is_descendant_of(pid, ancestor, snapshot):
+            result.add(pid)
+    return result
+
+
+def _track_sky_clients(
+    child_pid: int, tracked: set, stop_event: threading.Event, lock: threading.Lock
+) -> None:
+    # Poll while the Codex child runs, recording Sky clients whose ancestry still
+    # points at our child. Accumulating pids means we keep them even after they
+    # orphan at shutdown.
+    while True:
+        found = _sky_clients_under(child_pid, _process_snapshot())
+        if found:
+            with lock:
+                tracked.update(found)
+        if stop_event.wait(1.0):
+            break
+    found = _sky_clients_under(child_pid, _process_snapshot())
+    if found:
+        with lock:
+            tracked.update(found)
+
+
+def _reap_sky_clients(pids: set) -> None:
+    if not pids:
+        return
+    snapshot = _process_snapshot()
+    # Re-verify each pid is still a Sky client before signalling (guards against
+    # PID reuse between tracking and reaping).
+    victims = [
+        pid for pid in pids
+        if SKY_CLIENT_MARKER in snapshot.get(pid, (0, ""))[1]
+    ]
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if not victims:
+        return
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if not any(_pid_alive(pid) for pid in victims):
+            return
+        time.sleep(0.1)
+    snapshot = _process_snapshot()
+    for pid in victims:
+        if SKY_CLIENT_MARKER in snapshot.get(pid, (0, ""))[1]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def run_proxy(
     *,
     stdin: Any = sys.stdin,
@@ -348,6 +466,19 @@ def run_proxy(
     assert child.stdin is not None
     assert child.stdout is not None
     assert child.stderr is not None
+
+    reap_enabled = env.get("CODEX_COMPUTER_USE_NO_REAP") not in ("1", "true", "TRUE")
+    tracked_clients: set = set()
+    tracked_lock = threading.Lock()
+    stop_tracking = threading.Event()
+    tracker_thread: Optional[threading.Thread] = None
+    if reap_enabled:
+        tracker_thread = threading.Thread(
+            target=_track_sky_clients,
+            args=(child.pid, tracked_clients, stop_tracking, tracked_lock),
+            daemon=True,
+        )
+        tracker_thread.start()
 
     tools_list_ids: set[Any] = set()
     ids_lock = threading.Lock()
@@ -440,6 +571,15 @@ def run_proxy(
             return_code = child.wait()
     stdout_thread.join(timeout=2)
     stderr_thread.join(timeout=2)
+
+    if reap_enabled:
+        stop_tracking.set()
+        if tracker_thread is not None:
+            tracker_thread.join(timeout=2)
+        with tracked_lock:
+            to_reap = set(tracked_clients)
+        _reap_sky_clients(to_reap)
+
     if interrupted and return_code == 0:
         return 130
     return return_code

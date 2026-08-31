@@ -107,6 +107,51 @@ class BrokerUnitTests(unittest.TestCase):
         original = {"jsonrpc": "2.0", "id": 8, "method": "resources/list", "params": {}}
         self.assertEqual(self.broker.inject_client_message(original), original)
 
+    def test_sky_clients_under_only_matches_our_subtree(self):
+        marker = self.broker.SKY_CLIENT_MARKER
+        # our broker(100) -> codex mcp-server(200) -> codex worker(300) -> sky(400)
+        # an unrelated Codex session(500 -> 600 -> sky 700) must be left alone.
+        # a Sky *Service*(800) shares the "SkyComputerUse" prefix but is not a client.
+        snapshot = {
+            100: (1, "codex-computer-use-mcp"),
+            200: (100, "codex mcp-server"),
+            300: (200, "codex worker"),
+            400: (300, f"/x/{marker} mcp"),
+            500: (1, "codex mcp-server"),
+            600: (500, "codex worker"),
+            700: (600, f"/x/{marker} mcp"),
+            800: (1, "/x/SkyComputerUseService.app/Contents/MacOS/SkyComputerUseService"),
+        }
+        self.assertTrue(self.broker._is_descendant_of(400, 200, snapshot))
+        self.assertFalse(self.broker._is_descendant_of(700, 200, snapshot))
+        self.assertEqual(self.broker._sky_clients_under(200, snapshot), {400})
+
+    def test_is_descendant_handles_cycles_and_roots(self):
+        snapshot = {10: (20, "a"), 20: (10, "b")}  # cycle
+        self.assertFalse(self.broker._is_descendant_of(10, 999, snapshot))
+        # reaches root (ppid 1) without hitting ancestor 999 -> not a descendant
+        self.assertFalse(self.broker._is_descendant_of(42, 999, {42: (1, "orphan")}))
+
+    def test_reap_terminates_only_attributed_sky_clients(self):
+        import subprocess as sp
+        marker = "/x/" + self.broker.SKY_CLIENT_MARKER
+        proc = sp.Popen(["python3", "-c", "import time;time.sleep(60)", marker])
+        try:
+            time.sleep(0.5)
+            snapshot = self.broker._process_snapshot()
+            self.assertIn(proc.pid,
+                          self.broker._sky_clients_under(os.getpid(), snapshot))
+            self.assertNotIn(proc.pid,
+                             self.broker._sky_clients_under(999999, snapshot))
+            self.broker._reap_sky_clients({proc.pid})
+            rc = proc.wait(timeout=5)  # reaps the zombie; signal exit is negative
+            self.assertIsNotNone(rc)
+            self.assertLess(rc, 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
     def test_tools_list_describes_computer_use(self):
         message = {
             "jsonrpc": "2.0",
