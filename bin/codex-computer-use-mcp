@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""Transparent MCP broker for Codex's official Computer Use runtime."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional
+
+
+SERVER_NAME = "codex-computer-use"
+
+# Markers that identify an installed OpenAI Computer Use plugin root. OpenAI has
+# changed the bundle layout across versions, so accept any known marker rather
+# than a single hard-coded file: the 1.0.1000919+ bundle ships the runtime as a
+# skill (SKILL.md) driven from node_repl, while older bundles shipped a
+# `scripts/computer-use-client.mjs` wrapper. We only need to confirm the plugin
+# is present; the runtime itself is loaded inside Codex via `import("@oai/sky")`.
+PLUGIN_MARKERS = (
+    Path("skills/computer-use/SKILL.md"),
+    Path("scripts/computer-use-client.mjs"),
+)
+
+
+class BrokerError(RuntimeError):
+    pass
+
+
+def _has_plugin_marker(root: Path) -> bool:
+    return any((root / marker).is_file() for marker in PLUGIN_MARKERS)
+
+
+def _version_key(path: Path) -> tuple:
+    parts = re.split(r"(\d+)", path.name)
+    return tuple(int(part) if part.isdigit() else part.lower() for part in parts)
+
+
+def _valid_plugin_roots(paths: Iterable[Path]) -> list[Path]:
+    roots = []
+    seen = set()
+    for candidate in paths:
+        candidate = candidate.expanduser()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _has_plugin_marker(candidate):
+            roots.append(candidate)
+    return roots
+
+
+def discover_plugin_root(
+    *,
+    home: Optional[Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Path:
+    env = os.environ if env is None else env
+    home = Path.home() if home is None else home
+
+    override = env.get("CODEX_COMPUTER_USE_PLUGIN_ROOT")
+    if override:
+        root = Path(override).expanduser()
+        if _has_plugin_marker(root):
+            return root
+        markers = ", ".join(str(marker) for marker in PLUGIN_MARKERS)
+        raise BrokerError(
+            "CODEX_COMPUTER_USE_PLUGIN_ROOT does not contain a Computer Use "
+            f"plugin marker ({markers}): {root}"
+        )
+
+    cache = home / ".codex/plugins/cache/openai-bundled/computer-use"
+    temporary = (
+        home
+        / ".codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use"
+    )
+    application = Path(
+        "/Applications/Codex.app/Contents/Resources/plugins/"
+        "openai-bundled/plugins/computer-use"
+    )
+
+    candidates = [temporary, application]
+    for base in (cache, temporary, application):
+        if base.is_dir():
+            candidates.extend(path for path in base.iterdir() if path.is_dir())
+
+    roots = _valid_plugin_roots(candidates)
+    if not roots:
+        raise BrokerError(
+            "OpenAI Computer Use plugin was not found. "
+            "Install or update the Computer Use plugin in Codex, then retry. "
+            "You can also set CODEX_COMPUTER_USE_PLUGIN_ROOT."
+        )
+    return max(roots, key=_version_key)
+
+
+def _runtime_instruction() -> str:
+    return """Computer Use runtime requirement:
+- Use node_repl (JavaScript) for all macOS Computer Use actions.
+- Before Computer Use operations in a fresh or persistent node_repl kernel, run
+  this bootstrap unconditionally (also re-run it if globalThis.sky is missing or
+  behaving unexpectedly, e.g. after a persistent kernel was recycled):
+
+globalThis.sky = (await import("@oai/sky")).sky;
+
+Re-running the import is safe and repairs a stale or missing sky binding. Then
+use globalThis.sky for get_app_state, list_apps, click, type_text, press_key,
+scroll, drag, set_value, select_text, paste, and perform_secondary_action.
+Inspect the target app with get_app_state before acting and read it again after
+actions to verify the result."""
+
+
+def inject_client_message(message: Any) -> Any:
+    if not isinstance(message, dict):
+        return message
+    if message.get("method") != "tools/call":
+        return message
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return message
+    name = params.get("name")
+    if name not in {"codex", "codex-reply"}:
+        return message
+    arguments = params.get("arguments")
+    if not isinstance(arguments, dict):
+        return message
+
+    result = copy.deepcopy(message)
+    result_arguments = result["params"]["arguments"]
+    instruction = _runtime_instruction()
+    if name == "codex":
+        existing = result_arguments.get("developer-instructions")
+        if isinstance(existing, str) and existing.strip():
+            result_arguments["developer-instructions"] = (
+                existing.rstrip() + "\n\n" + instruction
+            )
+        else:
+            result_arguments["developer-instructions"] = instruction
+    else:
+        prompt = result_arguments.get("prompt")
+        if not isinstance(prompt, str):
+            return message
+        result_arguments["prompt"] = (
+            "[Computer Use runtime reminder]\n"
+            + instruction
+            + "\n\n[User continuation]\n"
+            + prompt
+        )
+    return result
+
+
+def rewrite_tools_list_response(message: Any, request_ids: set[Any]) -> Any:
+    if not isinstance(message, dict) or message.get("id") not in request_ids:
+        return message
+    result = message.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+        return message
+
+    rewritten = copy.deepcopy(message)
+    for tool in rewritten["result"]["tools"]:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("name") == "codex":
+            tool["title"] = "Codex Computer Use"
+            tool["description"] = (
+                "Start a Codex session with the official OpenAI Computer Use "
+                "runtime preconfigured. Use it to inspect and operate macOS apps."
+            )
+        elif tool.get("name") == "codex-reply":
+            tool["title"] = "Codex Computer Use Reply"
+            tool["description"] = (
+                "Continue a Codex Computer Use session while restoring the "
+                "official runtime bootstrap."
+            )
+    return rewritten
+
+
+def _read_json_object(path: Path) -> MutableMapping[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BrokerError(f"Cannot read valid JSON config {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise BrokerError(f"Expected a JSON object in {path}")
+    return value
+
+
+def _write_json_if_changed(
+    path: Path,
+    update: Callable[[MutableMapping[str, Any]], bool],
+) -> bool:
+    data = _read_json_object(path)
+    if not update(data):
+        return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup = path.with_name(path.name + ".codex-computer-use.bak")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+
+    rendered = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+    return True
+
+
+def _set_nested_server(
+    data: MutableMapping[str, Any],
+    keys: tuple[str, ...],
+    entry: Mapping[str, Any],
+) -> bool:
+    current: MutableMapping[str, Any] = data
+    for key in keys:
+        value = current.get(key)
+        if value is None:
+            value = {}
+            current[key] = value
+        if not isinstance(value, dict):
+            raise BrokerError(f"Config key {'.'.join(keys)} is not an object")
+        current = value
+    if current.get(SERVER_NAME) == entry:
+        return False
+    current[SERVER_NAME] = dict(entry)
+    return True
+
+
+def _remove_nested_server(
+    data: MutableMapping[str, Any],
+    keys: tuple[str, ...],
+    command: str,
+) -> bool:
+    current: Any = data
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return False
+        current = current[key]
+    if not isinstance(current, dict):
+        return False
+    entry = current.get(SERVER_NAME)
+    if not isinstance(entry, dict) or entry.get("command") != command:
+        return False
+    del current[SERVER_NAME]
+    return True
+
+
+def _client_config_paths(home: Path) -> tuple[tuple[Path, tuple[str, ...]], ...]:
+    return (
+        (home / ".claude.json", ("mcpServers",)),
+        (home / ".cursor/mcp.json", ("mcpServers",)),
+        (
+            home / "Library/Application Support/Cursor/User/settings.json",
+            ("mcp", "servers"),
+        ),
+    )
+
+
+def configure_clients(command: str, *, home: Optional[Path] = None) -> int:
+    home = Path.home() if home is None else home
+    entry = {"type": "stdio", "command": command, "args": []}
+    changed = 0
+    for path, keys in _client_config_paths(home):
+        if _write_json_if_changed(
+            path, lambda data, keys=keys: _set_nested_server(data, keys, entry)
+        ):
+            changed += 1
+    return changed
+
+
+def unconfigure_clients(command: str, *, home: Optional[Path] = None) -> int:
+    home = Path.home() if home is None else home
+    changed = 0
+    for path, keys in _client_config_paths(home):
+        if _write_json_if_changed(
+            path,
+            lambda data, keys=keys: _remove_nested_server(data, keys, command),
+        ):
+            changed += 1
+    return changed
+
+
+def _resolve_codex(env: Mapping[str, str]) -> str:
+    override = env.get("CODEX_COMPUTER_USE_CODEX")
+    if override:
+        if Path(override).is_file() and os.access(override, os.X_OK):
+            return override
+        raise BrokerError(f"CODEX_COMPUTER_USE_CODEX is not executable: {override}")
+    executable = shutil.which("codex")
+    if executable:
+        return executable
+    raise BrokerError("codex CLI was not found on PATH")
+
+
+def _decode_line(line: str) -> Any:
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def _encode_message(message: Any) -> str:
+    return json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def run_proxy(
+    *,
+    stdin: Any = sys.stdin,
+    stdout: Any = sys.stdout,
+    stderr: Any = sys.stderr,
+    env: Optional[Mapping[str, str]] = None,
+) -> int:
+    env = os.environ if env is None else env
+    # Fail fast with a clear message if the official Computer Use plugin is not
+    # installed; the runtime itself is loaded inside Codex via import("@oai/sky").
+    discover_plugin_root(env=env)
+    codex = _resolve_codex(env)
+    child = subprocess.Popen(
+        [codex, "mcp-server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=dict(env),
+    )
+    assert child.stdin is not None
+    assert child.stdout is not None
+    assert child.stderr is not None
+
+    tools_list_ids: set[Any] = set()
+    ids_lock = threading.Lock()
+    output_lock = threading.Lock()
+
+    def forward_stdout() -> None:
+        # readline() rather than `for line in child.stdout`: iterating a pipe
+        # file object does block-buffered read-ahead, which withholds a line
+        # until the buffer fills and deadlocks the interactive MCP exchange.
+        while True:
+            line = child.stdout.readline()
+            if not line:
+                break
+            decoded = _decode_line(line)
+            if decoded is None:
+                outgoing = line
+            else:
+                with ids_lock:
+                    outgoing_message = rewrite_tools_list_response(
+                        decoded, tools_list_ids
+                    )
+                    if decoded.get("id") in tools_list_ids:
+                        tools_list_ids.discard(decoded.get("id"))
+                outgoing = _encode_message(outgoing_message)
+            with output_lock:
+                stdout.write(outgoing)
+                stdout.flush()
+
+    def forward_stderr() -> None:
+        while True:
+            line = child.stderr.readline()
+            if not line:
+                break
+            stderr.write(line)
+            stderr.flush()
+
+    stdout_thread = threading.Thread(target=forward_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    previous_handlers = {}
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        if child.poll() is None:
+            child.terminate()
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, handle_signal)
+
+    interrupted = False
+    try:
+        while True:
+            line = stdin.readline()
+            if not line:
+                break
+            decoded = _decode_line(line)
+            if decoded is None:
+                outgoing = line
+            else:
+                if (
+                    isinstance(decoded, dict)
+                    and decoded.get("method") == "tools/list"
+                    and "id" in decoded
+                ):
+                    with ids_lock:
+                        tools_list_ids.add(decoded["id"])
+                outgoing = _encode_message(inject_client_message(decoded))
+            child.stdin.write(outgoing)
+            child.stdin.flush()
+    except (BrokenPipeError, KeyboardInterrupt):
+        interrupted = True
+    finally:
+        try:
+            child.stdin.close()
+        except BrokenPipeError:
+            pass
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+    try:
+        return_code = child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        child.terminate()
+        try:
+            return_code = child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            return_code = child.wait()
+    stdout_thread.join(timeout=2)
+    stderr_thread.join(timeout=2)
+    if interrupted and return_code == 0:
+        return 130
+    return return_code
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Broker official Codex Computer Use to MCP clients"
+    )
+    subparsers = parser.add_subparsers(dest="subcommand")
+    configure = subparsers.add_parser("configure")
+    configure.add_argument("--command", required=True)
+    unconfigure = subparsers.add_parser("unconfigure")
+    unconfigure.add_argument("--command", required=True)
+    subparsers.add_parser("print-plugin-root")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = _build_parser()
+    arguments = parser.parse_args(argv)
+    try:
+        if arguments.subcommand == "configure":
+            changed = configure_clients(arguments.command)
+            print(f"Configured {SERVER_NAME} in {changed} client config(s).")
+            return 0
+        if arguments.subcommand == "unconfigure":
+            changed = unconfigure_clients(arguments.command)
+            print(f"Removed {SERVER_NAME} from {changed} client config(s).")
+            return 0
+        if arguments.subcommand == "print-plugin-root":
+            print(discover_plugin_root())
+            return 0
+        return run_proxy()
+    except BrokerError as error:
+        print(f"codex-computer-use-mcp: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

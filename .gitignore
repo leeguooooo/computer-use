@@ -10,3 +10,5 @@ Package.resolved
 *.bak
 *.bak.*
 .claude/settings.local.json
+__pycache__/
+*.pyc

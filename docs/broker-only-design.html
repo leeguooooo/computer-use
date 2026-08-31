@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Computer Use Broker-only 设计规格</title>
+  <style>
+    :root {
+      --fg: #17202a;
+      --muted: #667085;
+      --accent: #176b5b;
+      --border: #d8dee6;
+      --surface: #f7f9fb;
+      --danger: #a13b32;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--fg);
+      background: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+    }
+    main { max-width: 1040px; margin: 0 auto; padding: 48px 28px 72px; }
+    header { border-bottom: 2px solid var(--accent); padding-bottom: 22px; margin-bottom: 32px; }
+    h1 { margin: 0 0 8px; font-size: 32px; letter-spacing: 0; }
+    h2 { margin: 36px 0 12px; font-size: 21px; letter-spacing: 0; }
+    p { margin: 8px 0 14px; }
+    .meta { color: var(--muted); }
+    .flow {
+      margin: 18px 0;
+      padding: 18px 20px;
+      background: var(--surface);
+      border-left: 4px solid var(--accent);
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0 24px; }
+    th, td { text-align: left; vertical-align: top; padding: 10px 12px; border: 1px solid var(--border); }
+    th { background: var(--surface); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
+    aside { margin: 22px 0; padding: 14px 18px; border: 1px solid var(--border); background: var(--surface); }
+    .removed { color: var(--danger); font-weight: 650; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Computer Use Broker-only 设计规格</h1>
+    <p class="meta">目标：让 Claude Code 与 Cursor 通过官方 Codex Computer Use 运行时稳定操作 macOS 应用。</p>
+  </header>
+
+  <section>
+    <h2>决策</h2>
+    <p>仓库不再复制、修改、重签名或注入 OpenAI 的 Computer Use app。仓库提供一个透明 MCP 代理，以官方 <code>codex mcp-server</code> 作为受信任执行边界。</p>
+    <div class="flow">Claude Code / Cursor
+        |
+        v  stdio MCP
+codex-computer-use-mcp
+        |
+        v  inject runtime bootstrap, otherwise passthrough
+official codex mcp-server
+        |
+        v
+node_repl -> computer-use-client.mjs -> @oai/sky</div>
+  </section>
+
+  <section>
+    <h2>代理职责</h2>
+    <table>
+      <thead><tr><th>范围</th><th>行为</th></tr></thead>
+      <tbody>
+        <tr><td>插件发现</td><td>从环境变量、Codex 插件缓存、临时 bundled marketplace 和 Codex.app 中发现当前版本的 <code>computer-use-client.mjs</code>，不写死版本号。</td></tr>
+        <tr><td><code>codex</code></td><td>保留调用方已有 developer instructions，并追加无条件、幂等的 <code>setupComputerUseRuntime()</code> bootstrap。</td></tr>
+        <tr><td><code>codex-reply</code></td><td>在续聊 prompt 前加入短恢复提示，避免持久 REPL 中错误的 <code>globalThis.sky</code> 阻止恢复。</td></tr>
+        <tr><td>协议</td><td>JSON-RPC 请求、响应、通知、进度与 MCP Elicitation 双向透传；只改写上述两个工具调用和工具发现说明。</td></tr>
+        <tr><td>生命周期</td><td>父进程 EOF、信号或异常时关闭并回收子 <code>codex mcp-server</code>，不创建 daemon。</td></tr>
+        <tr><td>失败模式</td><td>找不到 Codex CLI 或官方 wrapper 时立即给出明确错误，不回退到旧二进制 hack。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>安装与配置</h2>
+    <p><code>install.sh</code> 仅安装一个 Python 3 单文件代理到用户目录，并幂等合并以下配置：</p>
+    <table>
+      <thead><tr><th>客户端</th><th>配置位置</th><th>键</th></tr></thead>
+      <tbody>
+        <tr><td>Claude Code</td><td><code>~/.claude.json</code></td><td><code>mcpServers.codex-computer-use</code></td></tr>
+        <tr><td>Cursor Agent</td><td><code>~/.cursor/mcp.json</code></td><td><code>mcpServers.codex-computer-use</code></td></tr>
+        <tr><td>Cursor GUI</td><td><code>~/Library/Application Support/Cursor/User/settings.json</code></td><td><code>mcp.servers.codex-computer-use</code></td></tr>
+      </tbody>
+    </table>
+    <p>合并必须保留其他 MCP 和设置；内容未变化时不重写文件。卸载只移除由本工具管理且命令路径匹配的条目。</p>
+  </section>
+
+  <section>
+    <h2>移除的旧表面</h2>
+    <p class="removed">删除 NOP patch、TCC.db 直接写入、codesign、DYLD hook、复制官方 app、turn-ended notify 和旧 cua-cli。</p>
+    <p>因此 issue #3 至 #16 的问题面被结构性删除；issue #1 通过官方 Codex broker 身份边界解决，而不是继续绕过 sender authentication。</p>
+  </section>
+
+  <section>
+    <h2>验收</h2>
+    <table>
+      <thead><tr><th>层级</th><th>证据</th></tr></thead>
+      <tbody>
+        <tr><td>单元</td><td>插件版本选择、请求注入、原指令保留、工具描述、配置合并与卸载。</td></tr>
+        <tr><td>协议</td><td>假 MCP 子进程验证 Elicitation 往返、无关消息透传、EOF 回收。</td></tr>
+        <tr><td>官方直连</td><td>当前 bundled skill bootstrap 后读取并操作 Calculator。</td></tr>
+        <tr><td>Claude Code</td><td><code>claude -p</code> 经新代理完成不同算式并重新读取结果。</td></tr>
+        <tr><td>Cursor</td><td><code>cursor-agent -p</code> 经新代理完成不同算式并重新读取结果。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <aside>
+    <strong>非目标：</strong>不绕过 macOS TCC，不自动接受所有应用权限，不修改 Codex 插件缓存，不承诺第三方客户端自身不支持的 MCP 能力。
+  </aside>
+</main>
+</body>
+</html>

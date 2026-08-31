@@ -1,0 +1,3 @@
+[mcp_servers.codex-computer-use]
+command = "./bin/codex-computer-use-mcp"
+args = []
