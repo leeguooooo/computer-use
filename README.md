@@ -1,5 +1,22 @@
 # computer-use
 
+> ## ⚠️ Archived — superseded by [QwenLM/open-computer-use](https://github.com/QwenLM/open-computer-use)
+>
+> This project let non-Codex agents drive macOS Computer Use. That need is now
+> better served by **[open-computer-use](https://github.com/QwenLM/open-computer-use)**
+> (`npm i -g @qwen-code/open-computer-use`), which exposes fine-grained action
+> tools directly — sub-second reads, per-step screenshots, a visible cursor
+> overlay, and working fine-grained clicks on macOS 26 (Tahoe). In our own A/B it
+> was ~200× faster on equivalent reads. **Use it instead.**
+>
+> This repo is kept read-only as an honest record of the approach and the pivot.
+> The one thing it still does that open-computer-use does not: run Computer Use
+> inside the **official** OpenAI Codex runtime, legitimately (no binary patching,
+> no signature/team-id spoofing) — reach for it only if you specifically need the
+> official runtime and can accept a coarse, delegated-agent experience.
+
+---
+
 Drive **macOS Computer Use** from Claude Code, Cursor, or any MCP client — by
 brokering the **official OpenAI Codex Computer Use runtime**.
 
