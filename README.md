@@ -13,6 +13,28 @@ passes OpenAI's sender authentication the way it was designed to.
 > macOS 26/27 (Tahoe) wall, and depended on bypassing OpenAI's auth. It has been
 > **removed**. This is the broker rewrite.
 
+## Which should you use?
+
+This broker is legitimate and low-maintenance, but it exposes Computer Use as a
+single coarse `codex` agent tool: the driving client hands the whole task to a
+nested Codex agent and only gets a final text summary back — no fine-grained
+actions, no per-step screenshots, no live cursor to watch, and a Claude→GPT
+round-trip on every task.
+
+If you want the **best interactive experience** — the driving model calls
+`get_app_state` / `click` / `type_text` / … directly, sees each accessibility
+tree and screenshot, watches the cursor move, and courses-correct step by step —
+use an engine that exposes those fine-grained tools directly. The one we
+recommend is **[QwenLM/open-computer-use](https://github.com/QwenLM/open-computer-use)**
+(`npm i -g @qwen-code/open-computer-use`, then `open-computer-use install-claude-mcp`):
+MIT, cross-platform, its own on-screen cursor overlay, and sub-second reads. In
+our own A/B on macOS 26 (Tahoe) it was ~200× faster on equivalent reads and is
+the only path that keeps fine-grained clicking working on Tahoe.
+
+**Rule of thumb:** reach for `open-computer-use` for day-to-day interactive use;
+reach for this broker when you specifically want tasks executed by the *official*
+Codex runtime (and are fine with the coarse, delegated-agent experience).
+
 ## How it works
 
 ```
